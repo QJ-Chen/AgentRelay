@@ -1,0 +1,33 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local model/runtime data and generated audio
+.cache/
+.models/
+.runtime/
+audio/
+*.wav
+*.mp3
+*.m4a
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# AutoTTS runtime files (usually under ~/.config/autotts)
+*.log
+queue*.jsonl
+seen.json
+speech-state.json
+
+# macOS
+.DS_Store

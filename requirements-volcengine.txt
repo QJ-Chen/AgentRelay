@@ -1,0 +1,2 @@
+# Optional dependency for the Volcengine Seed TTS 2.0 WebSocket provider.
+websockets>=14,<17

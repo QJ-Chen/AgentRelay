@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "provider": "system_say",
+  "fallback_provider": "system_say",
+  "voice": "Tingting",
+  "rate": 190,
+  "max_chars": 1800,
+  "spoken_max_chars": 200,
+  "normal_cooldown_seconds": 12,
+  "max_queue_age_seconds": 30,
+  "dedupe_seconds": 30,
+  "queue_mode": "replace",
+  "final_notify_mode": "if_not_spoken",
+  "final_notify_suppress_seconds": 120,
+  "final_spoken_max_chars": 200,
+  "volcengine_resource_id": "seed-tts-2.0",
+  "volcengine_speaker": "zh_female_gaolengyujie_uranus_bigtts",
+  "volcengine_format": "mp3",
+  "volcengine_sample_rate": 24000,
+  "forward_notify": []
+}
