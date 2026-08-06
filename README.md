@@ -8,6 +8,7 @@ AutoTTS 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 的
 
 - **MVP 可用**：Codex `notify`、异步播放、已有通知转发、去重和队列替换。
 - **默认 provider**：`system_say`，无需网络和额外 Python 依赖，调试不产生云成本。
+- **默认语言**：简体中文（`zh-CN`），也可切换到美式英语（`en-US`）。
 - **可选 provider**：火山引擎豆包语音合成模型 2.0，按需安装并启用。
 - **播报范围**：当前回合结束通知 + Codex 主动调用的中间进展命令；还不是 token 级响应流。
 
@@ -69,6 +70,19 @@ python3 autotts.py speak-update --priority important \
 `AGENTS.md`。指导内容只影响模型选择，长度、冷却和隐私规则仍由 AutoTTS
 运行时强制执行。
 
+## 语言
+
+AutoTTS 默认使用中文和 macOS `Tingting` 声音。切换语言会在当前声音仍为旧语言
+默认值时同步选择合适的系统声音；自定义声音不会被覆盖。
+
+```sh
+python3 autotts.py language zh-CN
+python3 autotts.py language en-US
+```
+
+语言保存在 `~/.config/autotts/config.json` 的 `language` 字段中，并随队列请求
+传递。当前支持 `zh-CN` 和 `en-US`。
+
 ## Provider
 
 ### 本地 macOS `say`（默认，推荐调试阶段）
@@ -123,9 +137,11 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 | `python3 autotts.py install` | 接入 Codex `notify`，并保留已有通知转发 |
 | `python3 autotts.py uninstall` | 恢复安装前的 Codex 配置 |
 | `python3 autotts.py doctor` | 检查系统语音、provider 和转发配置 |
+| `python3 autotts.py status` | 显示队列长度、当前播放和最近结果 |
 | `python3 autotts.py speak TEXT` | 手动测试一次语音 |
 | `python3 autotts.py speak-update TEXT` | 排队一条模型选择的简短进展 |
 | `python3 autotts.py provider NAME` | 在 `system_say` 和 `volcengine` 间切换 |
+| `python3 autotts.py language NAME` | 在 `zh-CN` 和 `en-US` 间切换语言 |
 | `python3 autotts.py volcengine-test TEXT` | 不改变 provider，测试火山引擎请求 |
 | `python3 autotts.py volcengine-enable` | 启用火山引擎并保留本地 fallback |
 
@@ -134,6 +150,7 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 运行配置位于 `~/.config/autotts/config.json`。安装后通常只需修改：
 
 - `provider`：`system_say` 或 `volcengine`；
+- `language`：`zh-CN`（默认）或 `en-US`；
 - `voice`、`rate`：macOS `say` 的声音和语速；
 - `spoken_max_chars`、`normal_cooldown_seconds`：中间播报的长度和频率；
 - `final_notify_mode`：`off`、`if_not_spoken` 或 `always`；
@@ -146,7 +163,7 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 
 1. 先运行 `python3 autotts.py doctor`，确认 `speech: available`。
 2. 用 `python3 autotts.py speak "测试"` 区分系统播放问题和 Codex 集成问题。
-3. 检查 `~/.config/autotts/provider.log`，日志不会记录 API key。
+3. 检查 `~/.config/autotts/events.jsonl`，结构化日志不会记录正文或 API key。
 4. 确认 Codex 已重启，且 `~/.codex/config.toml` 的 `notify` 指向当前 checkout。
 5. 云 provider 失败时会自动 fallback 到 `system_say`；调试期间可直接运行
    `python3 autotts.py provider system_say`。

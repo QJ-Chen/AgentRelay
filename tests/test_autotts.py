@@ -13,6 +13,9 @@ class AutoTTSTest(unittest.TestCase):
     def test_defaults_do_not_contain_machine_specific_notify_path(self):
         self.assertEqual(autotts.defaults()["forward_notify"], [])
 
+    def test_defaults_use_chinese_language(self):
+        self.assertEqual(autotts.defaults()["language"], "zh-CN")
+
     def test_cleanup_removes_code_urls_and_markdown(self):
         self.assertEqual(
             autotts.clean_text("## Done\n- Read [docs](https://example.com)\n```py\nsecret\n```"),
@@ -42,6 +45,26 @@ class AutoTTSTest(unittest.TestCase):
                 self.assertTrue(autotts.enqueue("hello", config))
                 self.assertFalse(autotts.enqueue("hello", config))
                 self.assertEqual(len(autotts.QUEUE_PATH.read_text().splitlines()), 1)
+
+    def test_twenty_updates_do_not_leave_enqueue_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                QUEUE_PATH=root / "queue.jsonl",
+                SEEN_PATH=root / "seen.json",
+                SPEECH_STATE_PATH=root / "speech-state.json",
+                PLAYBACK_STATE_PATH=root / "playback-state.json",
+                ENQUEUE_LOCK=root / "enqueue.lock",
+                EVENT_LOG=root / "events.jsonl",
+            ):
+                config = autotts.defaults()
+                config["normal_cooldown_seconds"] = 0
+                for index in range(20):
+                    self.assertEqual(autotts.enqueue_update(f"update {index}", config)["status"], "accepted")
+                self.assertEqual(len(autotts.QUEUE_PATH.read_text().splitlines()), 20)
+                self.assertFalse(autotts.ENQUEUE_LOCK.exists())
 
     def test_disabled_does_not_enqueue(self):
         config = autotts.defaults()
@@ -167,6 +190,119 @@ class AutoTTSTest(unittest.TestCase):
             ), patch.object(autotts, "volcengine_api_key", return_value=""):
                 self.assertEqual(autotts.set_provider("volcengine"), 1)
                 self.assertFalse(config_path.exists())
+
+    def test_set_language_persists_language_and_default_voice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            with patch.multiple(autotts, APP_DIR=root, CONFIG_PATH=config_path):
+                self.assertEqual(autotts.set_language("en-US"), 0)
+                config = json.loads(config_path.read_text())
+                self.assertEqual((config["language"], config["voice"]), ("en-US", "Samantha"))
+
+    def test_versioned_seen_state_is_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seen_path = Path(directory) / "seen.json"
+            seen_path.write_text(json.dumps({"schema_version": 1, "items": {"request": 10.0}}))
+            with patch.object(autotts, "SEEN_PATH", seen_path):
+                self.assertEqual(autotts._load_seen(), {"request": 10.0})
+
+    def test_cancel_playback_terminates_recorded_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            playback_path = Path(directory) / "playback-state.json"
+            playback_path.write_text(json.dumps({"schema_version": 1, "pid": 1234}))
+            with patch.object(autotts, "PLAYBACK_STATE_PATH", playback_path), patch.object(
+                autotts.os, "kill"
+            ) as kill:
+                self.assertTrue(autotts._cancel_playback())
+                kill.assert_called_once_with(1234, autotts.signal.SIGTERM)
+
+    def test_spawn_worker_failure_is_contained(self):
+        with patch.object(autotts.subprocess, "Popen", side_effect=OSError("unavailable")), patch.object(
+            autotts, "_log_event"
+        ) as log:
+            self.assertFalse(autotts.spawn_worker())
+            log.assert_called_once_with("worker", "spawn", "failed", error="OSError")
+
+    def test_codex_notify_contains_runtime_directory_failure(self):
+        config = autotts.defaults()
+        with patch.object(autotts, "load_config", return_value=config), patch.object(
+            autotts, "forward_notify"
+        ), patch.object(autotts, "enqueue", side_effect=OSError("read only")), patch.object(
+            autotts, "_log_event"
+        ) as log:
+            payload = json.dumps({"type": "agent-turn-complete", "last-assistant-message": "done"})
+            self.assertEqual(autotts.main(["codex-notify", payload]), 0)
+            self.assertTrue(any(call.args[:3] == ("notify", "speech", "failed") for call in log.call_args_list))
+
+    def test_speak_update_reports_runtime_directory_failure(self):
+        with patch.object(autotts, "enqueue_update", side_effect=PermissionError("read only")), patch.object(
+            autotts, "_log_event"
+        ), patch("builtins.print") as output:
+            self.assertEqual(autotts.main(["speak-update", "progress"]), 0)
+            result = json.loads(output.call_args.args[0])
+            self.assertEqual(result, {"status": "skipped", "reason": "runtime_unavailable"})
+
+    def test_status_reports_queue_and_last_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue_path = root / "queue.jsonl"
+            result_path = root / "last-result.json"
+            queue_path.write_text("{}\n{}\n")
+            result_path.write_text(json.dumps({"status": "succeeded", "provider": "system_say"}))
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                QUEUE_PATH=queue_path,
+                LAST_RESULT_PATH=result_path,
+                PLAYBACK_STATE_PATH=root / "playback-state.json",
+                EVENT_LOG=root / "events.jsonl",
+            ), patch("builtins.print") as output:
+                self.assertEqual(autotts.status(), 0)
+                rendered = "\n".join(str(call.args[0]) for call in output.call_args_list)
+                self.assertIn("queue: 2", rendered)
+                self.assertIn("last result: succeeded (system_say)", rendered)
+
+    def test_doctor_rejects_malformed_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text("{bad json")
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                CONFIG_PATH=config_path,
+                EVENT_LOG=root / "events.jsonl",
+            ), patch.object(autotts, "volcengine_api_key", return_value=""), patch("builtins.print") as output:
+                self.assertEqual(autotts.doctor(), 1)
+                rendered = "\n".join(str(call.args[0]) for call in output.call_args_list)
+                self.assertIn("error: config is not valid JSON", rendered)
+
+    def test_install_reinstall_and_uninstall_preserve_existing_notify(self):
+        if autotts.tomllib is None:
+            self.skipTest("tomllib unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_config = root / "config.toml"
+            backup = root / "config.toml.autotts-backup"
+            app_dir = root / "runtime"
+            runtime_config = app_dir / "config.json"
+            codex_config.write_text('model = "test"\nnotify = ["/old", "turn-ended"]\n')
+            with patch.multiple(
+                autotts,
+                APP_DIR=app_dir,
+                CONFIG_PATH=runtime_config,
+                CODEX_CONFIG_PATH=codex_config,
+                CODEX_CONFIG_BACKUP=backup,
+            ):
+                self.assertEqual(autotts.install(), 0)
+                self.assertEqual(json.loads(runtime_config.read_text())["forward_notify"], ["/old", "turn-ended"])
+                installed = codex_config.read_text()
+                self.assertIn("codex-notify", installed)
+                self.assertEqual(autotts.install(), 0)
+                self.assertEqual(codex_config.read_text(), installed)
+                self.assertEqual(autotts.uninstall(), 0)
+                self.assertEqual(codex_config.read_text(), 'model = "test"\nnotify = ["/old", "turn-ended"]\n')
 
 
 if __name__ == "__main__":

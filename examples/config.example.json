@@ -1,7 +1,9 @@
 {
+  "schema_version": 1,
   "enabled": true,
   "provider": "system_say",
   "fallback_provider": "system_say",
+  "language": "zh-CN",
   "voice": "Tingting",
   "rate": 190,
   "max_chars": 1800,
