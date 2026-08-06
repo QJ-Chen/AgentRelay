@@ -1,4 +1,4 @@
-# AutoTTS Roadmap
+# AgentRelay Roadmap
 
 更新时间：2026-08-06
 
@@ -60,7 +60,7 @@
 3. 为 `doctor` 增加运行目录权限、播放命令、云依赖和配置合法性检查；
 4. 把当前播放器封装成可取消进程，`replace=true` 时中断正在播放的旧消息；
 5. 增加安装、重复安装、卸载和已有 notify 配置的集成测试；
-6. 添加一个安全的 `autotts status` 或等价诊断入口，显示队列长度和最近结果。
+6. 添加一个安全的 `agentrelay status` 或等价诊断入口，显示队列长度和最近结果。
 
 实现说明：运行时记录、状态和日志使用 `schema_version=1`；旧版无版本号状态仍可
 读取。`events.jsonl` 只记录元数据，播放器 PID 支持 replacement 中断，`doctor`
@@ -87,7 +87,7 @@
 3. daemon 启动失败时自动回退到 `system_say`，空闲后退出；
 4. 用 turn ID、内容 hash 和 source 关联主动更新与 final notify，而不是只看时间；
 5. 将云字符统计、失败次数和延迟写入本地指标文件，不记录正文和 key；
-6. 保持直接运行 `autotts.py` 的兼容路径，迁移配置时不破坏现有安装。
+6. 保持直接运行 `agentrelay.py` 的兼容路径，迁移配置时不破坏现有安装。
 
 实现说明：`SpeakRequest`、`TTSProvider` 和 `AudioPlayer` 已成为运行时契约；按需
 Unix socket daemon 支持 `health`、`speak` 和 `stop`，socket 权限为 `0600`，

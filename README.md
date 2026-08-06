@@ -1,6 +1,6 @@
-# AutoTTS
+# AgentRelay
 
-AutoTTS 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 的回合结束
+AgentRelay 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 的回合结束
 通知交给本地队列，默认使用 macOS `say` 播放，并允许 Codex 通过一个本地
 命令选择值得听到的简短进展播报。
 
@@ -27,25 +27,25 @@ AutoTTS 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 的
 在本仓库目录执行：
 
 ```sh
-python3 autotts.py install
-python3 autotts.py doctor
-python3 autotts.py speak "AutoTTS 已准备就绪。"
+python3 agentrelay.py install
+python3 agentrelay.py doctor
+python3 agentrelay.py speak "AgentRelay 已准备就绪。"
 ```
 
 然后重启 Codex。`install` 会：
 
 1. 备份原始的 `~/.codex/config.toml`；
 2. 将原有 `notify` 命令保存为转发目标，避免覆盖已有 Computer Use 通知；
-3. 把当前 checkout 的 `autotts.py codex-notify` 写入 Codex 配置；
-4. 创建运行配置 `~/.config/autotts/config.json`。
+3. 把当前 checkout 的 `agentrelay.py codex-notify` 写入 Codex 配置；
+4. 创建运行配置 `~/.config/agentrelay/config.json`。
 
 安装是可逆的：
 
 ```sh
-python3 autotts.py uninstall
+python3 agentrelay.py uninstall
 ```
 
-卸载会从 `~/.codex/config.toml.autotts-backup` 恢复配置。修改 Codex 配置后
+卸载会从 `~/.codex/config.toml.agentrelay-backup` 恢复配置。修改 Codex 配置后
 需要重启 Codex 才会生效。
 
 ## 中间进展播报
@@ -53,20 +53,20 @@ python3 autotts.py uninstall
 Codex 可以在一个回合尚未结束时，单独发送一条适合语音的摘要：
 
 ```sh
-python3 autotts.py speak-update "接口接入完成，正在验证通知链路。"
+python3 agentrelay.py speak-update "接口接入完成，正在验证通知链路。"
 ```
 
 需要立即提醒用户处理的阻塞事项可以绕过普通冷却：
 
 ```sh
-python3 autotts.py speak-update --priority important \
+python3 agentrelay.py speak-update --priority important \
   "需要你批准权限后才能继续。"
 ```
 
 支持 turn ID 的调用可精确抑制同一回合的最终 fallback：
 
 ```sh
-python3 autotts.py speak-update --turn-id TURN_ID "阶段结果已完成。"
+python3 agentrelay.py speak-update --turn-id TURN_ID "阶段结果已完成。"
 ```
 
 命令会立即返回 JSON，合成和播放在后台执行。运行时会拒绝空文本、过长文本、
@@ -75,20 +75,20 @@ python3 autotts.py speak-update --turn-id TURN_ID "阶段结果已完成。"
 
 要让 Codex 知道何时值得播报，可将
 [Codex Speech Guidance](docs/CODEX_SPEECH_GUIDANCE.md) 合并到相应的
-`AGENTS.md`。指导内容只影响模型选择，长度、冷却和隐私规则仍由 AutoTTS
+`AGENTS.md`。指导内容只影响模型选择，长度、冷却和隐私规则仍由 AgentRelay
 运行时强制执行。
 
 ## 语言
 
-AutoTTS 默认使用中文和 macOS `Tingting` 声音。切换语言会在当前声音仍为旧语言
+AgentRelay 默认使用中文和 macOS `Tingting` 声音。切换语言会在当前声音仍为旧语言
 默认值时同步选择合适的系统声音；自定义声音不会被覆盖。
 
 ```sh
-python3 autotts.py language zh-CN
-python3 autotts.py language en-US
+python3 agentrelay.py language zh-CN
+python3 agentrelay.py language en-US
 ```
 
-语言保存在 `~/.config/autotts/config.json` 的 `language` 字段中，并随队列请求
+语言保存在 `~/.config/agentrelay/config.json` 的 `language` 字段中，并随队列请求
 传递。当前支持 `zh-CN` 和 `en-US`。
 
 ## Provider
@@ -98,13 +98,13 @@ python3 autotts.py language en-US
 无需额外安装。查看当前配置和依赖：
 
 ```sh
-python3 autotts.py doctor
+python3 agentrelay.py doctor
 ```
 
 切换 provider：
 
 ```sh
-python3 autotts.py provider system_say
+python3 agentrelay.py provider system_say
 ```
 
 ### 火山引擎豆包语音合成模型 2.0（可选）
@@ -125,38 +125,38 @@ VOLCENGINE_TTS_API_KEY=your_api_key
 测试并启用：
 
 ```sh
-python3 autotts.py volcengine-test "你好，AutoTTS。"
-python3 autotts.py volcengine-enable
+python3 agentrelay.py volcengine-test "你好，AgentRelay。"
+python3 agentrelay.py volcengine-enable
 ```
 
 调试或节约成本时切回本地 provider：
 
 ```sh
-python3 autotts.py provider system_say
+python3 agentrelay.py provider system_say
 ```
 
-API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，也不会输出到
+API key 只从环境变量或项目 `.env` 读取，不写入 AgentRelay 配置，也不会输出到
 日志。`.env`、音频和运行时目录已加入 `.gitignore`，不要把真实 key 提交到 Git。
 
 ## 常用命令
 
 | 命令 | 用途 |
 | --- | --- |
-| `python3 autotts.py install` | 接入 Codex `notify`，并保留已有通知转发 |
-| `python3 autotts.py uninstall` | 恢复安装前的 Codex 配置 |
-| `python3 autotts.py doctor` | 检查系统语音、provider 和转发配置 |
-| `python3 autotts.py status` | 显示队列长度、当前播放和最近结果 |
-| `python3 autotts.py stop` | 停止当前播放并清空等待队列 |
-| `python3 autotts.py speak TEXT` | 手动测试一次语音 |
-| `python3 autotts.py speak-update TEXT` | 排队一条模型选择的简短进展 |
-| `python3 autotts.py provider NAME` | 在 `system_say` 和 `volcengine` 间切换 |
-| `python3 autotts.py language NAME` | 在 `zh-CN` 和 `en-US` 间切换语言 |
-| `python3 autotts.py volcengine-test TEXT` | 不改变 provider，测试火山引擎请求 |
-| `python3 autotts.py volcengine-enable` | 启用火山引擎并保留本地 fallback |
+| `python3 agentrelay.py install` | 接入 Codex `notify`，并保留已有通知转发 |
+| `python3 agentrelay.py uninstall` | 恢复安装前的 Codex 配置 |
+| `python3 agentrelay.py doctor` | 检查系统语音、provider 和转发配置 |
+| `python3 agentrelay.py status` | 显示队列长度、当前播放和最近结果 |
+| `python3 agentrelay.py stop` | 停止当前播放并清空等待队列 |
+| `python3 agentrelay.py speak TEXT` | 手动测试一次语音 |
+| `python3 agentrelay.py speak-update TEXT` | 排队一条模型选择的简短进展 |
+| `python3 agentrelay.py provider NAME` | 在 `system_say` 和 `volcengine` 间切换 |
+| `python3 agentrelay.py language NAME` | 在 `zh-CN` 和 `en-US` 间切换语言 |
+| `python3 agentrelay.py volcengine-test TEXT` | 不改变 provider，测试火山引擎请求 |
+| `python3 agentrelay.py volcengine-enable` | 启用火山引擎并保留本地 fallback |
 
 ## 配置
 
-运行配置位于 `~/.config/autotts/config.json`。安装后通常只需修改：
+运行配置位于 `~/.config/agentrelay/config.json`。安装后通常只需修改：
 
 - `provider`：`system_say` 或 `volcengine`；
 - `language`：`zh-CN`（默认）或 `en-US`；
@@ -167,11 +167,11 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 - `forward_notify`：已有通知命令，安装时自动保存。
 
 完整示例见 [examples/config.example.json](examples/config.example.json)。
-运行数据默认写入 `~/.config/autotts/`；测试时可设置 `AUTOTTS_HOME` 使用隔离目录。
+运行数据默认写入 `~/.config/agentrelay/`；测试时可设置 `AGENTRELAY_HOME` 使用隔离目录。
 
 ## 本地服务协议
 
-CLI 默认按需启动 `~/.config/autotts/autotts.sock`，socket 权限为 `0600`。协议为
+CLI 默认按需启动 `~/.config/agentrelay/agentrelay.sock`，socket 权限为 `0600`。协议为
 每行一个 JSON 请求，支持 `health`、`speak` 和 `stop`。`speak` 可以消费现有持久
 队列，也可携带 provider-neutral request：`id`、`text`、`language`、`voice`、
 `speed`、`interrupt`、`source` 和 `turn_id`。直接运行 `_worker` 的兼容路径仍然
@@ -179,12 +179,12 @@ CLI 默认按需启动 `~/.config/autotts/autotts.sock`，socket 权限为 `0600
 
 ## 故障排查
 
-1. 先运行 `python3 autotts.py doctor`，确认 `speech: available`。
-2. 用 `python3 autotts.py speak "测试"` 区分系统播放问题和 Codex 集成问题。
-3. 检查 `~/.config/autotts/events.jsonl`，结构化日志不会记录正文或 API key。
+1. 先运行 `python3 agentrelay.py doctor`，确认 `speech: available`。
+2. 用 `python3 agentrelay.py speak "测试"` 区分系统播放问题和 Codex 集成问题。
+3. 检查 `~/.config/agentrelay/events.jsonl`，结构化日志不会记录正文或 API key。
 4. 确认 Codex 已重启，且 `~/.codex/config.toml` 的 `notify` 指向当前 checkout。
 5. 云 provider 失败时会自动 fallback 到 `system_say`；调试期间可直接运行
-   `python3 autotts.py provider system_say`。
+   `python3 agentrelay.py provider system_say`。
 
 ## 开发
 
@@ -192,7 +192,7 @@ CLI 默认按需启动 `~/.config/autotts/autotts.sock`，socket 权限为 `0600
 
 ```sh
 python3 -m unittest discover -v
-python3 -m py_compile autotts.py volcengine_protocol.py volcengine_tts.py
+python3 -m py_compile agentrelay.py volcengine_protocol.py volcengine_tts.py
 ```
 
 项目按“薄 Codex 适配层 + 本地队列 + 可替换 provider”组织。当前实现刻意不

@@ -3,7 +3,7 @@
 ## Status
 
 The local `speak-update` command is the shipped MVP. The MCP tool described
-below is the next integration option, not a prerequisite for using AutoTTS.
+below is the next integration option, not a prerequisite for using AgentRelay.
 
 ## Decision
 
@@ -19,7 +19,7 @@ Codex commentary/final
 MCP speak_update(text, priority)
         |
         v
-AutoTTS queue -> provider -> playback
+AgentRelay queue -> provider -> playback
 
 Codex turn complete -> notify -> optional final fallback
 ```
@@ -115,7 +115,7 @@ Not worth speaking:
 ## Runtime Guardrails
 
 Model judgment is necessary but not sufficient. Enforce deterministic limits
-inside AutoTTS:
+inside AgentRelay:
 
 - reject empty text;
 - hard truncate or reject text over the configured maximum;
@@ -161,7 +161,7 @@ Install a short instruction in the project/plugin rather than asking Codex to
 emit `<tts>` tags:
 
 ```text
-Use the AutoTTS speak_update tool for user-relevant progress, blockers, major
+Use the AgentRelay speak_update tool for user-relevant progress, blockers, major
 milestones, and completion. Speak only information useful when the user is not
 watching the screen. Write a separate concise Chinese summary of one or two
 sentences; do not read normal commentary verbatim. Skip routine operations and

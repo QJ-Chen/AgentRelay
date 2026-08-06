@@ -56,7 +56,7 @@ evidence. Measurements must be taken on the target M3 using this workload.
 Codex notify
     |
     v
-AutoTTS queue -> persistent local daemon -> text segmentation
+AgentRelay queue -> persistent local daemon -> text segmentation
                                          -> provider
                                             |-- system_say
                                             |-- melotts
@@ -86,7 +86,7 @@ The daemon protocol should carry a provider-neutral request:
 
 Start with a Unix domain socket or loopback HTTP endpoint. The protocol choice
 is less important than keeping provider imports and model lifetime out of
-`autotts.py`.
+`agentrelay.py`.
 
 ## Benchmark Gate
 
@@ -135,7 +135,7 @@ fragile local patches.
 2. Add a persistent daemon with health, synthesize, stop, and shutdown actions.
 3. Make the player own a cancellable process so `queue_mode=replace` interrupts
    current audio, not only queued requests.
-4. Add `autotts benchmark`, `autotts voices`, and expanded `doctor` diagnostics.
+4. Add `agentrelay benchmark`, `agentrelay voices`, and expanded `doctor` diagnostics.
 5. Add the fixed corpus and emit JSON/Markdown benchmark reports.
 6. Keep `system_say` as the default throughout this phase.
 
@@ -145,7 +145,7 @@ provider boundary, including daemon-down fallback to `say`.
 ### Phase 2: MeloTTS Spike
 
 1. Pin MeloTTS and transitive dependencies in an isolated `uv` environment.
-2. Download weights through `autotts model install melotts`; verify checksums
+2. Download weights through `agentrelay model install melotts`; verify checksums
    where upstream publishes them and record model/license metadata.
 3. Keep the model warm in the daemon and synthesize sentence-sized chunks.
 4. Normalize Mandarin numbers, paths, code identifiers, and abbreviations before
@@ -193,9 +193,9 @@ restricted remote GPU workspace, not this laptop.
 Voice cloning requires explicit consent, local reference-audio management, and
 clear deletion controls. Add it only after ordinary local synthesis is stable:
 
-- `autotts voice import` validates and copies a reference clip locally;
+- `agentrelay voice import` validates and copies a reference clip locally;
 - reference audio and derived embeddings never leave the machine;
-- `autotts voice delete` removes both source and cached artifacts;
+- `agentrelay voice delete` removes both source and cached artifacts;
 - cloned voices are never enabled implicitly;
 - the UI/CLI identifies synthetic output and records the model/license version.
 
@@ -216,8 +216,8 @@ Keep old configuration valid and add fields incrementally:
 }
 ```
 
-Provider installation should be explicit. `autotts install` must continue to
-install only the notify integration; `autotts model install melotts` may
+Provider installation should be explicit. `agentrelay install` must continue to
+install only the notify integration; `agentrelay model install melotts` may
 download the neural runtime and weights. This keeps the base MVP reversible and
 prevents a notification setup command from unexpectedly downloading gigabytes.
 

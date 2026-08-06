@@ -1,8 +1,8 @@
 # Codex Speech Guidance
 
-## AutoTTS model-directed speech
+## AgentRelay model-directed speech
 
-Use the AutoTTS speak-update command only when the information is useful to a
+Use the AgentRelay speak-update command only when the information is useful to a
 user who may not be watching the screen. Good cases are a meaningful milestone,
 a material change of approach, a blocker or required user action, the start or
 finish of a long-running operation, and the final outcome of substantial work.
@@ -14,8 +14,8 @@ Generate a separate concise Chinese summary rather than reading commentary
 verbatim. Use one or two sentences, usually 20-60 Chinese characters, with a
 hard maximum of 200 characters. Lead with the result, blocker, or next action.
 
-Run from the AutoTTS checkout:
-python3 autotts.py speak-update "简短播报"
+Run from the AgentRelay checkout:
+python3 agentrelay.py speak-update "简短播报"
 
 For a blocker or user action that should be heard despite the normal cooldown,
 add `--priority important`. The command is asynchronous; continue working after

@@ -1,4 +1,4 @@
-# AutoTTS Integration Analysis
+# AgentRelay Integration Analysis
 
 ## Decision
 
@@ -23,7 +23,7 @@ The implementation now represents each queue item as a provider-neutral
 contracts. `SystemSayProvider` and `VolcengineProvider` share this boundary.
 
 CLI and Codex adapters durably enqueue first, then signal an on-demand Unix
-socket daemon at `~/.config/autotts/autotts.sock`. The daemon supports
+socket daemon at `~/.config/agentrelay/agentrelay.sock`. The daemon supports
 `health`, `speak`, and `stop`, owns queue consumption, and exits after an idle
 timeout. If daemon startup fails, the adapter launches a one-shot worker forced
 to `system_say`; setting `daemon_enabled=false` retains the configured-provider
@@ -74,8 +74,8 @@ fallbacks:
 
 This is an ownership boundary, not a trigger mechanism. It is still the right
 shape for the core because it can support Codex today and other agents later.
-It can expose subcommands such as `autotts notify`, `autotts speak`, and
-`autotts doctor` while sharing one queue, provider interface, and player.
+It can expose subcommands such as `agentrelay notify`, `agentrelay speak`, and
+`agentrelay doctor` while sharing one queue, provider interface, and player.
 
 ### Command or wrapper
 
@@ -136,12 +136,12 @@ ordering, and backpressure.
 ## Recommended MVP Scope
 
 - macOS first, using a simple local player and one TTS provider;
-- `autotts speak TEXT` for direct testing;
-- `autotts notify EVENT` for Codex integration;
+- `agentrelay speak TEXT` for direct testing;
+- `agentrelay notify EVENT` for Codex integration;
 - a single-worker queue with interruption/cancellation policy;
 - deterministic Markdown/code/URL cleanup;
 - config for enable/disable, voice, speed, maximum characters, and provider;
-- `autotts doctor` to verify Codex config, provider availability, and audio;
+- `agentrelay doctor` to verify Codex config, provider availability, and audio;
 - unit tests for payload parsing, cleanup, deduplication, and queue behavior.
 
 Defer voice cloning, ASR, VAD, cross-device audio, and token-level response

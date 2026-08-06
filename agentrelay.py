@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - Python 3.11+ is expected on current ma
     tomllib = None
 
 
-APP_DIR = Path(os.environ.get("AUTOTTS_HOME", Path.home() / ".config" / "autotts"))
+APP_DIR = Path(os.environ.get("AGENTRELAY_HOME", Path.home() / ".config" / "agentrelay"))
 SCHEMA_VERSION = 1
 CONFIG_PATH = APP_DIR / "config.json"
 QUEUE_PATH = APP_DIR / "queue.jsonl"
@@ -36,7 +36,7 @@ SPEECH_STATE_PATH = APP_DIR / "speech-state.json"
 PLAYBACK_STATE_PATH = APP_DIR / "playback-state.json"
 LAST_RESULT_PATH = APP_DIR / "last-result.json"
 METRICS_PATH = APP_DIR / "metrics.json"
-SOCKET_PATH = APP_DIR / "autotts.sock"
+SOCKET_PATH = APP_DIR / "agentrelay.sock"
 STOP_STATE_PATH = APP_DIR / "stop-state.json"
 DAEMON_LOCK_PATH = APP_DIR / "daemon.lock"
 METRICS_LOCK = APP_DIR / "metrics.lock"
@@ -50,7 +50,7 @@ PROVIDER_LOG = EVENT_LOG  # Backward-compatible public name.
 # machine-specific integration path into the repository defaults.
 DEFAULT_NOTIFY: list[str] = []
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
-CODEX_CONFIG_BACKUP = Path.home() / ".codex" / "config.toml.autotts-backup"
+CODEX_CONFIG_BACKUP = Path.home() / ".codex" / "config.toml.agentrelay-backup"
 SUPPORTED_LANGUAGES = {
     "zh-CN": {"system_voice": "Tingting"},
     "en-US": {"system_voice": "Samantha"},
@@ -939,7 +939,7 @@ def forward_notify(config: dict[str, Any], argv: list[str]) -> None:
         _log_event("notify", "forward", "started", command=str(command[0]))
     except OSError as exc:
         _log_event("notify", "forward", "failed", error=type(exc).__name__)
-        print(f"autotts: unable to forward notify: {exc}", file=sys.stderr)
+        print(f"agentrelay: unable to forward notify: {exc}", file=sys.stderr)
 
 
 def _config_errors(config: dict[str, Any]) -> list[str]:
@@ -978,7 +978,7 @@ def doctor() -> int:
             if not isinstance(raw_config, dict):
                 errors.append("config root must be a JSON object")
             elif int(raw_config.get("schema_version", SCHEMA_VERSION)) > SCHEMA_VERSION:
-                errors.append("config schema is newer than this AutoTTS version")
+                errors.append("config schema is newer than this AgentRelay version")
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             errors.append("config is not valid JSON")
     print(f"config: {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'using defaults'})")
@@ -1027,7 +1027,7 @@ def doctor() -> int:
 
 def enable_volcengine() -> int:
     if not volcengine_api_key():
-        print(f"autotts: VOLCENGINE_TTS_API_KEY is missing from {ENV_PATH}", file=sys.stderr)
+        print(f"agentrelay: VOLCENGINE_TTS_API_KEY is missing from {ENV_PATH}", file=sys.stderr)
         return 1
     config = load_config()
     config["provider"] = "volcengine"
@@ -1041,10 +1041,10 @@ def enable_volcengine() -> int:
 def set_provider(provider: str) -> int:
     """Persist a supported provider without changing the Codex integration."""
     if provider not in ("system_say", "volcengine"):
-        print(f"autotts: unsupported provider: {provider}", file=sys.stderr)
+        print(f"agentrelay: unsupported provider: {provider}", file=sys.stderr)
         return 2
     if provider == "volcengine" and not volcengine_api_key():
-        print(f"autotts: VOLCENGINE_TTS_API_KEY is missing from {ENV_PATH}", file=sys.stderr)
+        print(f"agentrelay: VOLCENGINE_TTS_API_KEY is missing from {ENV_PATH}", file=sys.stderr)
         return 1
     config = load_config()
     config["provider"] = provider
@@ -1058,7 +1058,7 @@ def set_provider(provider: str) -> int:
 def set_language(language: str) -> int:
     """Persist a supported language and its default system voice."""
     if language not in SUPPORTED_LANGUAGES:
-        print(f"autotts: unsupported language: {language}", file=sys.stderr)
+        print(f"agentrelay: unsupported language: {language}", file=sys.stderr)
         return 2
     config = load_config()
     previous_language = str(config.get("language", "zh-CN"))
@@ -1133,23 +1133,23 @@ def _replace_notify(source: str, notify_line: str) -> str:
 
 def install() -> int:
     if tomllib is None:
-        print("autotts: install requires Python 3.11 or newer", file=sys.stderr)
+        print("agentrelay: install requires Python 3.11 or newer", file=sys.stderr)
         return 1
     try:
         source = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
         parsed = tomllib.loads(source)
     except (FileNotFoundError, OSError, tomllib.TOMLDecodeError) as exc:
-        print(f"autotts: cannot read Codex config: {exc}", file=sys.stderr)
+        print(f"agentrelay: cannot read Codex config: {exc}", file=sys.stderr)
         return 1
 
     executable = str(Path(__file__).resolve())
     target = [executable, "codex-notify"]
     existing = parsed.get("notify")
     if existing == target:
-        print("AutoTTS is already installed.")
+        print("AgentRelay is already installed.")
         return 0
     if existing is not None and not isinstance(existing, list):
-        print("autotts: Codex notify setting is not a command array", file=sys.stderr)
+        print("agentrelay: Codex notify setting is not a command array", file=sys.stderr)
         return 1
 
     config = load_config()
@@ -1164,7 +1164,7 @@ def install() -> int:
     updated = _replace_notify(source, notify_line)
     CODEX_CONFIG_PATH.write_text(updated, encoding="utf-8")
     Path(executable).chmod(Path(executable).stat().st_mode | 0o111)
-    print(f"Installed AutoTTS in {CODEX_CONFIG_PATH}")
+    print(f"Installed AgentRelay in {CODEX_CONFIG_PATH}")
     print(f"Preserved previous notify command in {CONFIG_PATH}")
     print(f"Backup: {CODEX_CONFIG_BACKUP}")
     return 0
@@ -1172,7 +1172,7 @@ def install() -> int:
 
 def uninstall() -> int:
     if not CODEX_CONFIG_BACKUP.exists():
-        print(f"autotts: backup not found: {CODEX_CONFIG_BACKUP}", file=sys.stderr)
+        print(f"agentrelay: backup not found: {CODEX_CONFIG_BACKUP}", file=sys.stderr)
         return 1
     shutil.copy2(CODEX_CONFIG_BACKUP, CODEX_CONFIG_PATH)
     print(f"Restored {CODEX_CONFIG_PATH} from {CODEX_CONFIG_BACKUP}")
@@ -1180,7 +1180,7 @@ def uninstall() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="autotts")
+    parser = argparse.ArgumentParser(prog="agentrelay")
     sub = parser.add_subparsers(dest="command", required=True)
     speak = sub.add_parser("speak")
     speak.add_argument("text", nargs="+")
@@ -1202,7 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
     language = sub.add_parser("language", help="select the speech language")
     language.add_argument("name", choices=tuple(SUPPORTED_LANGUAGES))
     test_volcengine = sub.add_parser("volcengine-test")
-    test_volcengine.add_argument("text", nargs="*", default=["你好，豆包语音合成模型二点零已经接入 AutoTTS。"])
+    test_volcengine.add_argument("text", nargs="*", default=["你好，豆包语音合成模型二点零已经接入 AgentRelay。"])
     sub.add_parser("volcengine-enable")
     worker_parser = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("--fallback-system", action="store_true")
