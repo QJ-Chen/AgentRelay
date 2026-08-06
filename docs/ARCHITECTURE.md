@@ -16,6 +16,20 @@ Codex event adapter -> text policy/cleanup -> TTS provider -> audio player
 Only the first component should know how Codex emits a completed response. The
 remaining components should work from a provider-neutral `SpeakRequest`.
 
+## Current Runtime Boundary
+
+The implementation now represents each queue item as a provider-neutral
+`SpeakRequest` and dispatches it through `TTSProvider` and `AudioPlayer`
+contracts. `SystemSayProvider` and `VolcengineProvider` share this boundary.
+
+CLI and Codex adapters durably enqueue first, then signal an on-demand Unix
+socket daemon at `~/.config/autotts/autotts.sock`. The daemon supports
+`health`, `speak`, and `stop`, owns queue consumption, and exits after an idle
+timeout. If daemon startup fails, the adapter launches a one-shot worker forced
+to `system_say`; setting `daemon_enabled=false` retains the configured-provider
+direct worker path. This preserves old installations while keeping future
+model lifetime and transport details outside the notify adapter.
+
 ## Option Comparison
 
 | Option | How it triggers | Automatic | Streaming potential | Codex UI coverage | Main issue | MVP fit |

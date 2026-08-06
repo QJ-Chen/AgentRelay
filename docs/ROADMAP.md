@@ -75,6 +75,9 @@
 
 ### Phase 2：Provider 边界和常驻服务
 
+状态：已于 2026-08-06 实现；daemon 重启压力测试和真实 Codex turn ID payload
+仍需在长期使用中验证。
+
 目标：把当前脚本从“通知脚本”演进为可替换的本地语音运行时。
 
 交付：
@@ -85,6 +88,12 @@
 4. 用 turn ID、内容 hash 和 source 关联主动更新与 final notify，而不是只看时间；
 5. 将云字符统计、失败次数和延迟写入本地指标文件，不记录正文和 key；
 6. 保持直接运行 `autotts.py` 的兼容路径，迁移配置时不破坏现有安装。
+
+实现说明：`SpeakRequest`、`TTSProvider` 和 `AudioPlayer` 已成为运行时契约；按需
+Unix socket daemon 支持 `health`、`speak` 和 `stop`，socket 权限为 `0600`，
+默认空闲 60 秒退出。daemon 失败时使用 `system_say` 一次性 worker。主动更新和
+final notify 优先按 turn ID、其次按内容 hash 关联；旧 payload 继续使用时间窗口。
+云指标写入不含正文的 `metrics.json`，旧配置和 `_worker` 路径保持兼容。
 
 退出条件：
 
@@ -212,10 +221,10 @@ ASR、VAD 和语音命令会把项目从“提醒层”变成“交互层”，�
 
 ## 下一步执行顺序
 
-1. 用真实长任务验证 Phase 1 的连续更新、音频中断和故障诊断退出条件。
-2. 固定语料，生成 `say` 基准记录，明确 MeloTTS 的实际首音和内存数据。
-3. 抽取 provider 接口并实现最小 daemon；保持 `system_say` 默认。
-4. 验证“中间更新 + final fallback 抑制”策略并收集本地指标。
+1. 用真实长任务验证 Phase 1/2 的连续更新、音频中断和 daemon 重启退出条件。
+2. 捕获真实 Codex notify turn ID，验证精确 final fallback 抑制和旧 payload 兼容。
+3. 固定语料，生成 `say` 基准记录，明确 MeloTTS 的实际首音和内存数据。
+4. 按 Phase 3 门槛评估本地神经 TTS，不改变默认 `system_say`。
 5. 再决定 MCP server 是直接实现，还是先以 plugin/command 形式打包。
 
 ## 需要在真实使用中回答的问题

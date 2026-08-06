@@ -4,18 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 try:
     import tomllib
@@ -31,6 +35,11 @@ SEEN_PATH = APP_DIR / "seen.json"
 SPEECH_STATE_PATH = APP_DIR / "speech-state.json"
 PLAYBACK_STATE_PATH = APP_DIR / "playback-state.json"
 LAST_RESULT_PATH = APP_DIR / "last-result.json"
+METRICS_PATH = APP_DIR / "metrics.json"
+SOCKET_PATH = APP_DIR / "autotts.sock"
+STOP_STATE_PATH = APP_DIR / "stop-state.json"
+DAEMON_LOCK_PATH = APP_DIR / "daemon.lock"
+METRICS_LOCK = APP_DIR / "metrics.lock"
 ENQUEUE_LOCK = APP_DIR / "enqueue.lock"
 WORKER_LOCK = APP_DIR / "worker.lock"
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -57,6 +66,8 @@ def defaults() -> dict[str, Any]:
         "language": "zh-CN",
         "voice": "Tingting",
         "rate": 190,
+        "daemon_enabled": True,
+        "daemon_idle_seconds": 60,
         "volcengine_speaker": "zh_female_gaolengyujie_uranus_bigtts",
         "volcengine_resource_id": "seed-tts-2.0",
         "volcengine_format": "mp3",
@@ -81,6 +92,76 @@ def load_config() -> dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return result
+
+
+@dataclass
+class SpeakRequest:
+    id: str
+    text: str
+    language: str = "zh-CN"
+    voice: str = "Tingting"
+    speed: float = 1.0
+    interrupt: bool = True
+    source: str = "manual"
+    turn_id: str = ""
+    content_hash: str = ""
+    config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_item(cls, item: dict[str, Any], fallback_config: dict[str, Any]) -> "SpeakRequest":
+        config = item.get("config") if isinstance(item.get("config"), dict) else fallback_config
+        text = str(item["text"])
+        return cls(
+            id=str(item.get("id", request_id(str(item.get("source", "request")), text))),
+            text=text,
+            language=str(config.get("language", "zh-CN")),
+            voice=str(config.get("voice", "Tingting")),
+            speed=float(config.get("speed", 1.0)),
+            interrupt=bool(item.get("replace", True)),
+            source=str(item.get("source", "request")),
+            turn_id=str(item.get("turn_id", "")),
+            content_hash=str(item.get("content_hash", content_id(text))),
+            config=config,
+        )
+
+
+class AudioPlayer(Protocol):
+    def play(self, command: list[str], provider: str, item_id: str = "") -> bool: ...
+
+    def stop(self, reason: str = "requested") -> bool: ...
+
+
+class TTSProvider(Protocol):
+    name: str
+
+    def speak(self, request: SpeakRequest, player: AudioPlayer) -> bool: ...
+
+
+class ProcessAudioPlayer:
+    def play(self, command: list[str], provider: str, item_id: str = "") -> bool:
+        return _run_playback(command, provider, item_id)
+
+    def stop(self, reason: str = "requested") -> bool:
+        return _cancel_playback(reason)
+
+
+class SystemSayProvider:
+    name = "system_say"
+
+    def speak(self, request: SpeakRequest, player: AudioPlayer) -> bool:
+        default_voice = SUPPORTED_LANGUAGES.get(
+            request.language, SUPPORTED_LANGUAGES["zh-CN"]
+        )["system_voice"]
+        rate = int(request.config.get("rate", round(190 * request.speed)))
+        command = ["/usr/bin/say", "-v", request.voice or default_voice, "-r", str(rate), request.text]
+        return player.play(command, self.name, request.id)
+
+
+class VolcengineProvider:
+    name = "volcengine"
+
+    def speak(self, request: SpeakRequest, player: AudioPlayer) -> bool:
+        return _volcengine_speak_request(request, player)
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -203,6 +284,33 @@ def parse_notify(argv: list[str]) -> tuple[str, str]:
         return event, joined
 
 
+def _find_turn_id(obj: Any) -> str:
+    if isinstance(obj, dict):
+        for key in ("turn_id", "turn-id", "turnId", "thread_id", "thread-id", "threadId"):
+            value = obj.get(key)
+            if isinstance(value, (str, int)) and str(value):
+                return str(value)
+        for value in obj.values():
+            found = _find_turn_id(value)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for value in reversed(obj):
+            found = _find_turn_id(value)
+            if found:
+                return found
+    return ""
+
+
+def notify_turn_id(argv: list[str]) -> str:
+    for candidate in (" ".join(argv), " ".join(argv[1:])):
+        try:
+            return _find_turn_id(json.loads(candidate))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return ""
+
+
 def _acquire_lock(path: Path, attempts: int = 50) -> bool:
     for _ in range(attempts):
         try:
@@ -249,6 +357,8 @@ def enqueue(
     priority: str = "normal",
     replace: bool = True,
     max_chars: int | None = None,
+    turn_id: str = "",
+    item_id: str = "",
 ) -> bool:
     if not config.get("enabled", True):
         _log_event("enqueue", "request", "skipped", reason="disabled")
@@ -262,7 +372,7 @@ def enqueue(
         _log_event("enqueue", "request", "skipped", reason="busy")
         return False
     try:
-        item_id = request_id(event, text)
+        item_id = item_id or request_id(event, text)
         now = time.time()
         window = max(0, int(config.get("dedupe_seconds", 30)))
         seen = {key: stamp for key, stamp in _load_seen().items() if now - float(stamp) <= window}
@@ -275,6 +385,8 @@ def enqueue(
             "text": text,
             "created": now,
             "source": source,
+            "turn_id": turn_id,
+            "content_hash": content_id(text),
             "priority": priority,
             "replace": replace,
             "config": config,
@@ -291,7 +403,13 @@ def enqueue(
         _release_lock(ENQUEUE_LOCK)
 
 
-def enqueue_update(text: str, config: dict[str, Any], priority: str = "normal", replace: bool = True) -> dict[str, Any]:
+def enqueue_update(
+    text: str,
+    config: dict[str, Any],
+    priority: str = "normal",
+    replace: bool = True,
+    turn_id: str = "",
+) -> dict[str, Any]:
     if priority not in ("normal", "important"):
         _log_event("enqueue", "update", "skipped", reason="invalid_priority")
         return {"status": "skipped", "reason": "invalid_priority"}
@@ -329,6 +447,8 @@ def enqueue_update(text: str, config: dict[str, Any], priority: str = "normal", 
             "text": cleaned,
             "created": now,
             "source": "model-command",
+            "turn_id": turn_id,
+            "content_hash": content_id(cleaned),
             "priority": priority,
             "replace": replace,
             "config": config,
@@ -337,11 +457,27 @@ def enqueue_update(text: str, config: dict[str, Any], priority: str = "normal", 
             stream.write(json.dumps(item, ensure_ascii=False) + "\n")
         seen[item_id] = now
         _write_json(SEEN_PATH, {"schema_version": SCHEMA_VERSION, "items": seen})
+        recent = state.get("recent", []) if isinstance(state.get("recent"), list) else []
+        recent = [entry for entry in recent if now - float(entry.get("created", 0)) <= 3600]
+        recent.append(
+            {
+                "created": now,
+                "turn_id": turn_id,
+                "content_hash": item["content_hash"],
+                "source": item["source"],
+                "priority": priority,
+            }
+        )
         _write_json(
             SPEECH_STATE_PATH,
             {
                 "schema_version": SCHEMA_VERSION,
-                "state": {"last_update_at": now, "last_text_hash": item_id, "priority": priority},
+                "state": {
+                    "last_update_at": now,
+                    "last_text_hash": item_id,
+                    "priority": priority,
+                    "recent": recent[-100:],
+                },
             },
         )
         if replace:
@@ -352,19 +488,30 @@ def enqueue_update(text: str, config: dict[str, Any], priority: str = "normal", 
         _release_lock(ENQUEUE_LOCK)
 
 
-def should_speak_final(config: dict[str, Any]) -> bool:
+def should_speak_final(config: dict[str, Any], turn_id: str = "", content_hash: str = "") -> bool:
     mode = config.get("final_notify_mode", "if_not_spoken")
     if mode == "off":
         return False
     if mode == "always":
         return True
     state = _load_speech_state()
+    recent = state.get("recent", []) if isinstance(state.get("recent"), list) else []
+    if turn_id and any(entry.get("turn_id") == turn_id for entry in recent):
+        return False
+    if content_hash and any(entry.get("content_hash") == content_hash for entry in recent):
+        return False
+    if turn_id or content_hash:
+        return True
     suppress = max(0, int(config.get("final_notify_suppress_seconds", 120)))
     return time.time() - float(state.get("last_update_at", 0)) > suppress
 
 
 def request_id(event: str, payload: str) -> str:
     return hashlib.sha256((event + "\0" + payload).encode()).hexdigest()
+
+
+def content_id(payload: str) -> str:
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _cancel_playback(reason: str = "replaced") -> bool:
@@ -412,7 +559,7 @@ def _run_playback(command: list[str], provider: str, item_id: str = "") -> bool:
             pass
 
 
-def worker() -> None:
+def worker(force_system_say: bool = False) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     if not _acquire_lock(WORKER_LOCK, attempts=100):
         _log_event("worker", "start", "skipped", reason="already_running")
@@ -448,13 +595,24 @@ def worker() -> None:
                     items = items[replacement:]
             for item in items:
                 try:
+                    try:
+                        stop_state = json.loads(STOP_STATE_PATH.read_text(encoding="utf-8"))
+                        stopped_at = float(stop_state.get("stopped_at", 0))
+                    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+                        stopped_at = 0
+                    if float(item.get("created", 0)) <= stopped_at:
+                        _log_event("worker", "request", "skipped", item_id=item.get("id", ""), reason="stopped")
+                        continue
                     max_age = max(0, int(config.get("max_queue_age_seconds", 30)))
                     if max_age and time.time() - float(item.get("created", 0)) > max_age:
                         _log_event("worker", "request", "skipped", item_id=item.get("id", ""), reason="expired")
                         continue
                     item_config = item.get("config", config)
+                    if force_system_say:
+                        item_config = {**item_config, "provider": "system_say", "fallback_provider": "system_say"}
+                        item = {**item, "config": item_config}
                     provider = str(item_config.get("provider", "system_say"))
-                    succeeded = speak_with_provider(item["text"], item_config, item_id=item.get("id", ""))
+                    succeeded = speak_request(SpeakRequest.from_item(item, config))
                     _record_result(item.get("id", ""), provider, "succeeded" if succeeded else "failed")
                     _log_event(
                         "worker",
@@ -471,27 +629,186 @@ def worker() -> None:
         _log_event("worker", "stop", "completed", pid=os.getpid())
 
 
-def spawn_worker() -> bool:
+def spawn_worker(force_system_say: bool = False) -> bool:
     try:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_worker"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        command = [sys.executable, str(Path(__file__).resolve()), "_worker"]
+        if force_system_say:
+            command.append("--fallback-system")
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         return True
     except OSError as exc:
         _log_event("worker", "spawn", "failed", error=type(exc).__name__)
         return False
 
 
+def _socket_request(payload: dict[str, Any], timeout: float = 0.35) -> dict[str, Any] | None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(SOCKET_PATH))
+            client.sendall(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+            response = client.makefile("rb").readline(64 * 1024)
+        return json.loads(response) if response else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _daemon_alive() -> bool:
+    response = _socket_request({"operation": "health"})
+    return bool(response and response.get("status") == "ok")
+
+
+def spawn_daemon() -> bool:
+    if _daemon_alive():
+        return True
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        _log_event("daemon", "spawn", "failed", error=type(exc).__name__)
+        return False
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        if _daemon_alive():
+            return True
+        time.sleep(0.025)
+    _log_event("daemon", "spawn", "failed", reason="startup_timeout")
+    return False
+
+
+def start_runtime(config: dict[str, Any]) -> bool:
+    if not config.get("daemon_enabled", True):
+        return spawn_worker()
+    if spawn_daemon():
+        response = _socket_request({"operation": "speak"})
+        if response and response.get("status") == "accepted":
+            return True
+    return spawn_worker(force_system_say=True)
+
+
+def _stop_runtime(clear_queue: bool = True) -> bool:
+    stopped = _cancel_playback("stop_requested")
+    if clear_queue:
+        try:
+            _write_json(
+                STOP_STATE_PATH,
+                {"schema_version": SCHEMA_VERSION, "stopped_at": time.time()},
+            )
+            QUEUE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return stopped
+
+
+def _daemon_process_queue(activity: dict[str, float]) -> None:
+    activity["last"] = time.monotonic()
+    worker()
+    activity["last"] = time.monotonic()
+
+
+def _handle_daemon_request(payload: dict[str, Any], activity: dict[str, float]) -> dict[str, Any]:
+    operation = payload.get("operation")
+    activity["last"] = time.monotonic()
+    if operation == "health":
+        return {"status": "ok", "schema_version": SCHEMA_VERSION, "queue": _queue_length()}
+    if operation == "speak":
+        if "request" in payload:
+            request_data = payload.get("request")
+            if not isinstance(request_data, dict) or not isinstance(request_data.get("text"), str):
+                return {"status": "error", "reason": "invalid_request"}
+            config = load_config()
+            for key in ("language", "voice"):
+                if isinstance(request_data.get(key), str) and request_data[key]:
+                    config[key] = request_data[key]
+            if isinstance(request_data.get("speed"), (int, float)) and not isinstance(request_data["speed"], bool):
+                config["speed"] = max(0.25, min(4.0, float(request_data["speed"])))
+            accepted = enqueue(
+                request_data["text"],
+                config,
+                event=str(request_data.get("id", "daemon")),
+                source=str(request_data.get("source", "daemon")),
+                replace=bool(request_data.get("interrupt", True)),
+                turn_id=str(request_data.get("turn_id", "")),
+                item_id=str(request_data.get("id", "")),
+            )
+            if not accepted:
+                return {"status": "skipped", "reason": "not_enqueued"}
+        threading.Thread(target=_daemon_process_queue, args=(activity,), daemon=True).start()
+        return {"status": "accepted"}
+    if operation == "stop":
+        stopped = _stop_runtime(bool(payload.get("clear_queue", True)))
+        return {"status": "stopped", "playback_was_active": stopped}
+    return {"status": "error", "reason": "unsupported_operation"}
+
+
+def daemon() -> int:
+    config = load_config()
+    idle_seconds = max(1, int(config.get("daemon_idle_seconds", 60)))
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    lock_stream = DAEMON_LOCK_PATH.open("a")
+    try:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_stream.close()
+        return 0
+    if SOCKET_PATH.exists():
+        if _daemon_alive():
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            lock_stream.close()
+            return 0
+        SOCKET_PATH.unlink(missing_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    activity = {"last": time.monotonic()}
+    try:
+        try:
+            server.bind(str(SOCKET_PATH))
+        except OSError as exc:
+            _log_event("daemon", "bind", "failed", error=type(exc).__name__)
+            return 1
+        os.chmod(SOCKET_PATH, 0o600)
+        server.listen(8)
+        server.settimeout(0.25)
+        _log_event("daemon", "start", "started", pid=os.getpid())
+        if _queue_length():
+            threading.Thread(target=_daemon_process_queue, args=(activity,), daemon=True).start()
+        while True:
+            idle = time.monotonic() - activity["last"] >= idle_seconds
+            if idle and not WORKER_LOCK.exists() and not PLAYBACK_STATE_PATH.exists() and _queue_length() == 0:
+                break
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            with connection:
+                try:
+                    line = connection.makefile("rb").readline(64 * 1024)
+                    payload = json.loads(line) if line else {}
+                    response = _handle_daemon_request(payload, activity)
+                except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                    response = {"status": "error", "reason": "invalid_json"}
+                connection.sendall(json.dumps(response, ensure_ascii=True).encode("utf-8") + b"\n")
+        return 0
+    finally:
+        server.close()
+        try:
+            SOCKET_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+        lock_stream.close()
+        _log_event("daemon", "stop", "idle_exit", pid=os.getpid())
+
+
 def system_say(text: str, config: dict[str, Any], item_id: str = "") -> bool:
-    language = str(config.get("language", "zh-CN"))
-    default_voice = SUPPORTED_LANGUAGES.get(language, SUPPORTED_LANGUAGES["zh-CN"])["system_voice"]
-    command = [
-        "/usr/bin/say",
-        "-v",
-        str(config.get("voice") or default_voice),
-        "-r",
-        str(config.get("rate", 190)),
-        text,
-    ]
-    return _run_playback(command, "system_say", item_id)
+    request = SpeakRequest.from_item(
+        {"id": item_id, "text": text, "config": config, "source": "compatibility"}, config
+    )
+    return SystemSayProvider().speak(request, ProcessAudioPlayer())
 
 
 def volcengine_api_key() -> str:
@@ -506,20 +823,50 @@ def _log_provider_error(message: str) -> None:
     _log_event("provider", "operation", "failed", detail=message)
 
 
-def volcengine_speak(text: str, config: dict[str, Any], item_id: str = "") -> bool:
+def _update_metrics(provider: str, status: str, *, characters: int = 0, latency_ms: float = 0) -> None:
+    if not _acquire_lock(METRICS_LOCK):
+        return
+    try:
+        try:
+            metrics = json.loads(METRICS_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            metrics = {"schema_version": SCHEMA_VERSION, "providers": {}}
+        providers = metrics.setdefault("providers", {})
+        current = providers.setdefault(
+            provider,
+            {"requests": 0, "successes": 0, "failures": 0, "characters": 0, "latency_ms_total": 0},
+        )
+        current["requests"] = int(current.get("requests", 0)) + 1
+        current["successes" if status == "succeeded" else "failures"] = int(
+            current.get("successes" if status == "succeeded" else "failures", 0)
+        ) + 1
+        current["characters"] = int(current.get("characters", 0)) + max(0, characters)
+        current["latency_ms_total"] = round(float(current.get("latency_ms_total", 0)) + latency_ms, 1)
+        metrics["updated_at"] = time.time()
+        _write_json(METRICS_PATH, metrics)
+    except (OSError, TypeError, ValueError):
+        pass
+    finally:
+        _release_lock(METRICS_LOCK)
+
+
+def _volcengine_speak_request(request: SpeakRequest, player: AudioPlayer) -> bool:
     from volcengine_tts import synthesize_sync
 
+    config = request.config
     api_key = volcengine_api_key()
     if not api_key:
+        _update_metrics("volcengine", "failed", characters=len(request.text))
         _log_provider_error("VOLCENGINE_TTS_API_KEY is missing")
         return False
     audio_dir = APP_DIR / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     audio_format = str(config.get("volcengine_format", "mp3"))
     output = audio_dir / f"speech-{uuid.uuid4().hex}.{audio_format}"
+    started = time.monotonic()
     try:
         result = synthesize_sync(
-            text=text,
+            text=request.text,
             output=output,
             api_key=api_key,
             speaker=str(config.get("volcengine_speaker", "zh_female_gaolengyujie_uranus_bigtts")),
@@ -528,6 +875,9 @@ def volcengine_speak(text: str, config: dict[str, Any], item_id: str = "") -> bo
             sample_rate=int(config.get("volcengine_sample_rate", 24000)),
         )
     except Exception as exc:
+        _update_metrics(
+            "volcengine", "failed", characters=len(request.text), latency_ms=(time.monotonic() - started) * 1000
+        )
         _log_event(
             "provider", "synthesis", "failed", provider="volcengine", error=type(exc).__name__
         )
@@ -541,9 +891,23 @@ def volcengine_speak(text: str, config: dict[str, Any], item_id: str = "") -> bo
             bytes=result["bytes"],
             log_id=result.get("log_id", ""),
         )
-        return _run_playback(["/usr/bin/afplay", str(output)], "volcengine", item_id)
+        succeeded = player.play(["/usr/bin/afplay", str(output)], "volcengine", request.id)
+        _update_metrics(
+            "volcengine",
+            "succeeded" if succeeded else "failed",
+            characters=len(request.text),
+            latency_ms=(time.monotonic() - started) * 1000,
+        )
+        return succeeded
     finally:
         output.unlink(missing_ok=True)
+
+
+def volcengine_speak(text: str, config: dict[str, Any], item_id: str = "") -> bool:
+    request = SpeakRequest.from_item(
+        {"id": item_id, "text": text, "config": config, "source": "compatibility"}, config
+    )
+    return VolcengineProvider().speak(request, ProcessAudioPlayer())
 
 
 def speak_with_provider(text: str, config: dict[str, Any], item_id: str = "") -> bool:
@@ -553,6 +917,17 @@ def speak_with_provider(text: str, config: dict[str, Any], item_id: str = "") ->
     if provider != "system_say" and config.get("fallback_provider", "system_say") != "system_say":
         return False
     return system_say(text, config, item_id)
+
+
+def speak_request(request: SpeakRequest, player: AudioPlayer | None = None) -> bool:
+    player = player or ProcessAudioPlayer()
+    provider_name = request.config.get("provider", "system_say")
+    provider: TTSProvider = VolcengineProvider() if provider_name == "volcengine" else SystemSayProvider()
+    if provider_name == "volcengine" and provider.speak(request, player):
+        return True
+    if provider_name != "system_say" and request.config.get("fallback_provider", "system_say") != "system_say":
+        return False
+    return SystemSayProvider().speak(request, player)
 
 
 def forward_notify(config: dict[str, Any], argv: list[str]) -> None:
@@ -614,6 +989,8 @@ def doctor() -> int:
     print(f"language: {config.get('language', 'zh-CN')}")
     print(f"voice: {config.get('voice', 'Tingting')}")
     print(f"provider: {config.get('provider', 'system_say')}")
+    print(f"daemon: {'available' if _daemon_alive() else 'not running'}")
+    print(f"daemon socket: {SOCKET_PATH}")
     print(f"speech updates: max={config.get('spoken_max_chars', 200)} cooldown={config.get('normal_cooldown_seconds', 12)}s")
     print(f"final notify: {config.get('final_notify_mode', 'if_not_spoken')}")
     print(f"volcengine key: {'configured' if volcengine_api_key() else 'missing'}")
@@ -717,6 +1094,7 @@ def status() -> int:
     print(f"enabled: {str(bool(config.get('enabled', True))).lower()}")
     print(f"language: {config.get('language', 'zh-CN')}")
     print(f"provider: {config.get('provider', 'system_say')}")
+    print(f"daemon: {'running' if _daemon_alive() else 'stopped'}")
     print(f"queue: {_queue_length()}")
     print(f"playback: {playback_status}")
     if result:
@@ -724,6 +1102,7 @@ def status() -> int:
     else:
         print("last result: none")
     print(f"event log: {EVENT_LOG}")
+    print(f"metrics: {METRICS_PATH}")
     return 0
 
 
@@ -809,10 +1188,13 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("text", nargs="+")
     update.add_argument("--priority", choices=("normal", "important"), default="normal")
     update.add_argument("--replace", action=argparse.BooleanOptionalAction, default=True)
+    update.add_argument("--turn-id", default="")
     notify = sub.add_parser("codex-notify")
     notify.add_argument("event_and_payload", nargs="*")
     sub.add_parser("doctor")
     sub.add_parser("status")
+    sub.add_parser("stop")
+    sub.add_parser("daemon")
     sub.add_parser("install")
     sub.add_parser("uninstall")
     provider = sub.add_parser("provider", help="select the speech provider")
@@ -822,13 +1204,14 @@ def main(argv: list[str] | None = None) -> int:
     test_volcengine = sub.add_parser("volcengine-test")
     test_volcengine.add_argument("text", nargs="*", default=["你好，豆包语音合成模型二点零已经接入 AutoTTS。"])
     sub.add_parser("volcengine-enable")
-    sub.add_parser("_worker", help=argparse.SUPPRESS)
+    worker_parser = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    worker_parser.add_argument("--fallback-system", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "speak":
         config = load_config()
         try:
             if enqueue(" ".join(args.text), config, "manual"):
-                spawn_worker()
+                start_runtime(config)
             return 0
         except OSError as exc:
             _log_event("enqueue", "manual", "failed", error=type(exc).__name__)
@@ -837,21 +1220,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "speak-update":
         config = load_config()
         try:
-            result = enqueue_update(" ".join(args.text), config, args.priority, args.replace)
+            result = enqueue_update(" ".join(args.text), config, args.priority, args.replace, args.turn_id)
         except OSError as exc:
             _log_event("enqueue", "update", "failed", error=type(exc).__name__)
             result = {"status": "skipped", "reason": "runtime_unavailable"}
         print(json.dumps(result, ensure_ascii=False))
         if result["status"] == "accepted":
-            spawn_worker()
+            start_runtime(config)
         return 0
     if args.command == "_worker":
-        worker()
+        worker(args.fallback_system)
         return 0
     if args.command == "doctor":
         return doctor()
     if args.command == "status":
         return status()
+    if args.command == "stop":
+        response = _socket_request({"operation": "stop", "clear_queue": True})
+        stopped = response is not None or _stop_runtime()
+        print(json.dumps(response or {"status": "stopped", "playback_was_active": stopped}))
+        return 0
+    if args.command == "daemon":
+        return daemon()
     if args.command == "install":
         return install()
     if args.command == "uninstall":
@@ -865,13 +1255,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "volcengine-enable":
         return enable_volcengine()
     event, text = parse_notify(args.event_and_payload)
+    turn_id = notify_turn_id(args.event_and_payload)
     config = load_config()
+    final_content_hash = content_id(clean_text(text, int(config.get("final_spoken_max_chars", 200))))
     _log_event("notify", "received", "accepted", event=event or "unknown", has_text=bool(text))
     # Forward first so an audio failure cannot affect the existing integration.
     forward_notify(config, args.event_and_payload)
     try:
         supported_event = event in ("agent-turn-complete", "turn-ended", "turn_completed", "turn_complete")
-        policy_allows = should_speak_final(config) if supported_event else False
+        policy_allows = should_speak_final(config, turn_id, final_content_hash) if supported_event else False
         if not supported_event:
             _log_event("notify", "speech", "skipped", reason="unsupported_event")
         elif not policy_allows:
@@ -882,8 +1274,9 @@ def main(argv: list[str] | None = None) -> int:
             event,
             source="notify",
             max_chars=int(config.get("final_spoken_max_chars", 200)),
+            turn_id=turn_id,
         ):
-            spawn_worker()
+            start_runtime(config)
     except (OSError, TypeError, ValueError) as exc:
         _log_event("notify", "speech", "failed", error=type(exc).__name__)
     return 0

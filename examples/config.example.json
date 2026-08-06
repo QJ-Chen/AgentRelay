@@ -6,6 +6,8 @@
   "language": "zh-CN",
   "voice": "Tingting",
   "rate": 190,
+  "daemon_enabled": true,
+  "daemon_idle_seconds": 60,
   "max_chars": 1800,
   "spoken_max_chars": 200,
   "normal_cooldown_seconds": 12,

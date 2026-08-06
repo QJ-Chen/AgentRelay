@@ -11,6 +11,8 @@ AutoTTS 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 的
 - **默认语言**：简体中文（`zh-CN`），也可切换到美式英语（`en-US`）。
 - **可选 provider**：火山引擎豆包语音合成模型 2.0，按需安装并启用。
 - **播报范围**：当前回合结束通知 + Codex 主动调用的中间进展命令；还不是 token 级响应流。
+- **本地服务**：按需启动 Unix socket daemon，空闲后退出；启动失败时回退到一次性
+  `system_say` worker。
 
 ## 快速开始
 
@@ -59,6 +61,12 @@ python3 autotts.py speak-update "接口接入完成，正在验证通知链路�
 ```sh
 python3 autotts.py speak-update --priority important \
   "需要你批准权限后才能继续。"
+```
+
+支持 turn ID 的调用可精确抑制同一回合的最终 fallback：
+
+```sh
+python3 autotts.py speak-update --turn-id TURN_ID "阶段结果已完成。"
 ```
 
 命令会立即返回 JSON，合成和播放在后台执行。运行时会拒绝空文本、过长文本、
@@ -138,6 +146,7 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 | `python3 autotts.py uninstall` | 恢复安装前的 Codex 配置 |
 | `python3 autotts.py doctor` | 检查系统语音、provider 和转发配置 |
 | `python3 autotts.py status` | 显示队列长度、当前播放和最近结果 |
+| `python3 autotts.py stop` | 停止当前播放并清空等待队列 |
 | `python3 autotts.py speak TEXT` | 手动测试一次语音 |
 | `python3 autotts.py speak-update TEXT` | 排队一条模型选择的简短进展 |
 | `python3 autotts.py provider NAME` | 在 `system_say` 和 `volcengine` 间切换 |
@@ -152,12 +161,21 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AutoTTS 配置，�
 - `provider`：`system_say` 或 `volcengine`；
 - `language`：`zh-CN`（默认）或 `en-US`；
 - `voice`、`rate`：macOS `say` 的声音和语速；
+- `daemon_enabled`、`daemon_idle_seconds`：启用按需服务及设置空闲退出时间；
 - `spoken_max_chars`、`normal_cooldown_seconds`：中间播报的长度和频率；
 - `final_notify_mode`：`off`、`if_not_spoken` 或 `always`；
 - `forward_notify`：已有通知命令，安装时自动保存。
 
 完整示例见 [examples/config.example.json](examples/config.example.json)。
 运行数据默认写入 `~/.config/autotts/`；测试时可设置 `AUTOTTS_HOME` 使用隔离目录。
+
+## 本地服务协议
+
+CLI 默认按需启动 `~/.config/autotts/autotts.sock`，socket 权限为 `0600`。协议为
+每行一个 JSON 请求，支持 `health`、`speak` 和 `stop`。`speak` 可以消费现有持久
+队列，也可携带 provider-neutral request：`id`、`text`、`language`、`voice`、
+`speed`、`interrupt`、`source` 和 `turn_id`。直接运行 `_worker` 的兼容路径仍然
+保留。云调用计数、字符数、失败数和累计延迟写入 `metrics.json`，不记录正文。
 
 ## 故障排查
 

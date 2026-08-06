@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +17,69 @@ class AutoTTSTest(unittest.TestCase):
 
     def test_defaults_use_chinese_language(self):
         self.assertEqual(autotts.defaults()["language"], "zh-CN")
+
+    def test_speak_request_builds_provider_neutral_request(self):
+        config = autotts.defaults()
+        request = autotts.SpeakRequest.from_item(
+            {
+                "id": "request-1",
+                "text": "hello",
+                "source": "test",
+                "turn_id": "turn-1",
+                "content_hash": "hash-1",
+                "config": config,
+            },
+            config,
+        )
+        self.assertEqual(
+            (request.id, request.language, request.voice, request.source, request.turn_id),
+            ("request-1", "zh-CN", "Tingting", "test", "turn-1"),
+        )
+
+    def test_system_provider_uses_audio_player_contract(self):
+        class FakePlayer:
+            def __init__(self):
+                self.command = []
+
+            def play(self, command, provider, item_id=""):
+                self.command = command
+                self.provider = provider
+                self.item_id = item_id
+                return True
+
+            def stop(self, reason="requested"):
+                return True
+
+        request = autotts.SpeakRequest(
+            id="request-1", text="hello", language="en-US", voice="Samantha", config=autotts.defaults()
+        )
+        player = FakePlayer()
+        self.assertTrue(autotts.SystemSayProvider().speak(request, player))
+        self.assertEqual((player.provider, player.item_id), ("system_say", "request-1"))
+        self.assertEqual(player.command[:4], ["/usr/bin/say", "-v", "Samantha", "-r"])
+
+    def test_fake_provider_satisfies_provider_contract(self):
+        class FakeProvider:
+            name = "fake"
+
+            def speak(self, request, player):
+                return request.text == "hello" and player.stop("fake")
+
+        class FakePlayer:
+            def play(self, command, provider, item_id=""):
+                return True
+
+            def stop(self, reason="requested"):
+                return reason == "fake"
+
+        self.assertTrue(FakeProvider().speak(autotts.SpeakRequest(id="1", text="hello"), FakePlayer()))
+
+    def test_volcengine_provider_uses_provider_contract(self):
+        request = autotts.SpeakRequest(id="request-1", text="hello", config=autotts.defaults())
+        player = object()
+        with patch.object(autotts, "_volcengine_speak_request", return_value=True) as speak:
+            self.assertTrue(autotts.VolcengineProvider().speak(request, player))
+            speak.assert_called_once_with(request, player)
 
     def test_cleanup_removes_code_urls_and_markdown(self):
         self.assertEqual(
@@ -173,6 +238,31 @@ class AutoTTSTest(unittest.TestCase):
             with patch.object(autotts, "SPEECH_STATE_PATH", state), patch.object(autotts.time, "time", return_value=110.0):
                 self.assertFalse(autotts.should_speak_final(autotts.defaults()))
 
+    def test_turn_id_suppresses_only_matching_final_notify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "speech-state.json"
+            queue = root / "queue.jsonl"
+            seen = root / "seen.json"
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                SPEECH_STATE_PATH=state,
+                QUEUE_PATH=queue,
+                SEEN_PATH=seen,
+                PLAYBACK_STATE_PATH=root / "playback-state.json",
+                ENQUEUE_LOCK=root / "enqueue.lock",
+                EVENT_LOG=root / "events.jsonl",
+            ):
+                config = autotts.defaults()
+                self.assertEqual(autotts.enqueue_update("progress", config, turn_id="turn-1")["status"], "accepted")
+                self.assertFalse(autotts.should_speak_final(config, turn_id="turn-1", content_hash="different"))
+                self.assertTrue(autotts.should_speak_final(config, turn_id="turn-2", content_hash="different"))
+
+    def test_notify_turn_id_extracts_nested_identifier(self):
+        payload = json.dumps({"type": "agent-turn-complete", "thread": {"turn_id": "turn-42"}})
+        self.assertEqual(autotts.notify_turn_id([payload]), "turn-42")
+
     def test_set_provider_persists_local_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
@@ -262,6 +352,139 @@ class AutoTTSTest(unittest.TestCase):
                 rendered = "\n".join(str(call.args[0]) for call in output.call_args_list)
                 self.assertIn("queue: 2", rendered)
                 self.assertIn("last result: succeeded (system_say)", rendered)
+
+    def test_daemon_health_speak_and_stop_protocol(self):
+        activity = {"last": 0.0}
+        self.assertEqual(autotts._handle_daemon_request({"operation": "health"}, activity)["status"], "ok")
+        with patch.object(autotts.threading, "Thread") as thread:
+            response = autotts._handle_daemon_request({"operation": "speak"}, activity)
+            self.assertEqual(response["status"], "accepted")
+            thread.assert_called_once()
+        with patch.object(autotts, "_stop_runtime", return_value=True):
+            response = autotts._handle_daemon_request({"operation": "stop"}, activity)
+            self.assertEqual(response, {"status": "stopped", "playback_was_active": True})
+
+    def test_daemon_idle_exit_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config = autotts.defaults()
+            config["daemon_idle_seconds"] = 1
+            config_path.write_text(json.dumps(config))
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                CONFIG_PATH=config_path,
+                SOCKET_PATH=root / "autotts.sock",
+                DAEMON_LOCK_PATH=root / "daemon.lock",
+                QUEUE_PATH=root / "queue.jsonl",
+                WORKER_LOCK=root / "worker.lock",
+                PLAYBACK_STATE_PATH=root / "playback-state.json",
+                EVENT_LOG=root / "events.jsonl",
+            ):
+                for _ in range(2):
+                    daemon_thread = threading.Thread(target=autotts.daemon)
+                    daemon_thread.start()
+                    deadline = time.monotonic() + 1
+                    response = None
+                    while time.monotonic() < deadline:
+                        response = autotts._socket_request({"operation": "health"}, timeout=0.05)
+                        if response:
+                            break
+                        time.sleep(0.01)
+                    if response is None:
+                        daemon_thread.join(2)
+                        self.skipTest("Unix socket operations are unavailable in this sandbox")
+                    self.assertEqual(response["status"], "ok")
+                    self.assertEqual(autotts.SOCKET_PATH.stat().st_mode & 0o777, 0o600)
+                    daemon_thread.join(2)
+                    self.assertFalse(daemon_thread.is_alive())
+                    self.assertFalse(autotts.SOCKET_PATH.exists())
+
+    def test_start_runtime_falls_back_to_worker(self):
+        config = autotts.defaults()
+        with patch.object(autotts, "spawn_daemon", return_value=False), patch.object(
+            autotts, "spawn_worker", return_value=True
+        ) as worker:
+            self.assertTrue(autotts.start_runtime(config))
+            worker.assert_called_once_with(force_system_say=True)
+
+    def test_direct_mode_does_not_force_system_provider(self):
+        config = autotts.defaults()
+        config["daemon_enabled"] = False
+        with patch.object(autotts, "spawn_worker", return_value=True) as worker:
+            self.assertTrue(autotts.start_runtime(config))
+            worker.assert_called_once_with()
+
+    def test_daemon_speak_accepts_provider_neutral_fields(self):
+        activity = {"last": 0.0}
+        with patch.object(autotts, "enqueue", return_value=True) as enqueue, patch.object(
+            autotts.threading, "Thread"
+        ):
+            response = autotts._handle_daemon_request(
+                {
+                    "operation": "speak",
+                    "request": {
+                        "id": "request-1",
+                        "text": "hello",
+                        "language": "en-US",
+                        "voice": "Samantha",
+                        "speed": 1.25,
+                        "interrupt": True,
+                        "turn_id": "turn-1",
+                    },
+                },
+                activity,
+            )
+            self.assertEqual(response["status"], "accepted")
+            call = enqueue.call_args
+            self.assertEqual(call.args[1]["language"], "en-US")
+            self.assertEqual(call.args[1]["speed"], 1.25)
+            self.assertEqual(call.kwargs["turn_id"], "turn-1")
+            self.assertEqual(call.kwargs["item_id"], "request-1")
+
+    def test_stop_marker_discards_items_already_in_worker_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = root / "queue.jsonl"
+            item = {
+                "schema_version": 1,
+                "id": "old-item",
+                "text": "old",
+                "created": 10,
+                "source": "test",
+                "replace": False,
+                "config": autotts.defaults(),
+            }
+            queue.write_text(json.dumps(item) + "\n")
+            with patch.multiple(
+                autotts,
+                APP_DIR=root,
+                CONFIG_PATH=root / "config.json",
+                QUEUE_PATH=queue,
+                STOP_STATE_PATH=root / "stop-state.json",
+                METRICS_LOCK=root / "metrics.lock",
+                WORKER_LOCK=root / "worker.lock",
+                ENQUEUE_LOCK=root / "enqueue.lock",
+                EVENT_LOG=root / "events.jsonl",
+            ), patch.object(autotts, "speak_request") as speak:
+                autotts._write_json(autotts.STOP_STATE_PATH, {"schema_version": 1, "stopped_at": 20})
+                autotts.worker()
+                speak.assert_not_called()
+
+    def test_cloud_metrics_do_not_store_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metrics_path = root / "metrics.json"
+            with patch.multiple(
+                autotts, METRICS_PATH=metrics_path, METRICS_LOCK=root / "metrics.lock"
+            ):
+                autotts._update_metrics("volcengine", "succeeded", characters=12, latency_ms=25.5)
+                metrics_text = metrics_path.read_text()
+                metrics = json.loads(metrics_text)
+                self.assertNotIn("secret spoken text", metrics_text)
+                self.assertEqual(metrics["providers"]["volcengine"]["characters"], 12)
+                self.assertEqual(metrics["providers"]["volcengine"]["successes"], 1)
 
     def test_doctor_rejects_malformed_config(self):
         with tempfile.TemporaryDirectory() as directory:
