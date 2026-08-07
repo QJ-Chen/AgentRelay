@@ -2,10 +2,10 @@
 
 ## Decision
 
-Build the MVP as a standalone TTS daemon/CLI with a thin Codex `notify` adapter.
+Build the runtime as a standalone TTS daemon/CLI with a thin Codex `notify` adapter.
 Package the adapter, configuration, and instructions as a Codex plugin later.
-Do not use MCP as the primary trigger and do not require `<tts>` tags for the
-MVP.
+Do not use MCP as the only trigger and do not require `<tts>` tags. MCP is an
+explicit control plane; host-side `notify` remains the reliable final fallback.
 
 The key architectural separation is:
 
@@ -27,8 +27,8 @@ socket daemon at `~/.config/agentrelay/agentrelay.sock`. The daemon supports
 `health`, `speak`, and `stop`, owns queue consumption, and exits after an idle
 timeout. If daemon startup fails, the adapter launches a one-shot worker forced
 to `system_say`; setting `daemon_enabled=false` retains the configured-provider
-direct worker path. This preserves old installations while keeping future
-model lifetime and transport details outside the notify adapter.
+direct worker path. Future model lifetime and transport details stay outside the
+notify adapter.
 
 ## Option Comparison
 
@@ -87,11 +87,11 @@ structured events.
 
 ### MCP
 
-MCP is designed to expose data and actions to the agent. A `speak` tool is
-useful for explicit speech commands, previews, voice selection, or future
-agent-directed audio. It is not a reliable event listener: the model controls
-whether and when the call happens. Using MCP for every final response also
-duplicates the response text in tool arguments and delays completion.
+MCP is implemented as a dependency-free stdio JSON-RPC server with
+`speak_update`, `stop`, and `preview`. It forwards requests to the shared daemon
+socket, so it does not duplicate queue policy or provider lifetime. It is an
+explicit control plane, not a reliable event listener: the model controls
+whether and when the call happens. `notify` remains the final-turn fallback.
 
 ### Plugin
 

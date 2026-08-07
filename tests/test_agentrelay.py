@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import threading
 import time
@@ -368,6 +369,54 @@ class AgentRelayTest(unittest.TestCase):
         with patch.object(agentrelay, "_stop_runtime", return_value=True):
             response = agentrelay._handle_daemon_request({"operation": "stop"}, activity)
             self.assertEqual(response, {"status": "stopped", "playback_was_active": True})
+
+    def test_mcp_initialize_and_tools_list(self):
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]
+        input_text = "".join(json.dumps(request) + "\n" for request in requests)
+        with patch("sys.stdin", io.StringIO(input_text)), patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(agentrelay.mcp_server(), 0)
+            responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "agentrelay")
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"speak_update", "stop", "preview"})
+
+    def test_mcp_speak_update_uses_daemon_and_returns_runtime_result(self):
+        with patch.object(agentrelay, "_daemon_alive", return_value=True), patch.object(
+            agentrelay, "_socket_request", return_value={"status": "accepted", "priority": "important"}
+        ) as request:
+            result = agentrelay._mcp_call_tool(
+                "speak_update", {"text": "接口接入完成", "priority": "important", "replace": True}
+            )
+        self.assertFalse(result["isError"])
+        self.assertIn("accepted", result["content"][0]["text"])
+        self.assertEqual(request.call_args.args[0]["request"]["source"], "mcp")
+
+    def test_mcp_rejects_invalid_tool_arguments(self):
+        result = agentrelay._mcp_call_tool("speak_update", {"text": "x", "priority": "urgent"})
+        self.assertTrue(result["isError"])
+
+    def test_install_registers_mcp_server(self):
+        if agentrelay.tomllib is None:
+            self.skipTest("tomllib unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_config = root / "config.toml"
+            backup = root / "config.toml.agentrelay-backup"
+            runtime = root / "runtime"
+            config_path = runtime / "config.json"
+            codex_config.write_text('model = "test"\nnotify = ["/old"]\n')
+            with patch.multiple(
+                agentrelay,
+                APP_DIR=runtime,
+                CONFIG_PATH=config_path,
+                CODEX_CONFIG_PATH=codex_config,
+                CODEX_CONFIG_BACKUP=backup,
+            ):
+                self.assertEqual(agentrelay.install(), 0)
+                parsed = agentrelay.tomllib.loads(codex_config.read_text())
+                self.assertEqual(parsed["mcp_servers"]["agentrelay"]["args"], ["mcp-server"])
 
     def test_daemon_idle_exit_and_restart(self):
         with tempfile.TemporaryDirectory() as directory:

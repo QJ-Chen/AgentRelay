@@ -104,6 +104,8 @@ final notify 优先按 turn ID、其次按内容 hash 关联；旧 payload 继�
 
 ### Phase 3：本地神经 TTS 评估与接入
 
+状态：推迟；当前不执行 Phase 3，保留 `system_say` 和 Volcengine provider。
+
 目标：在不牺牲响应速度和机器可用性的前提下，提供比 `say` 更自然的中文声音。
 
 顺序：
@@ -128,6 +130,9 @@ final notify 优先按 turn ID、其次按内容 hash 关联；旧 payload 继�
 
 ### Phase 4：MCP 控制面
 
+状态：已于 2026-08-07 实现；需要真实长任务验证工具调用频率和 final fallback
+策略后再考虑调整默认模式。
+
 目标：让 Codex 能通过结构化工具主动播报，同时不把 MCP 变成唯一触发源。
 
 首批工具建议只有：
@@ -135,6 +140,11 @@ final notify 优先按 turn ID、其次按内容 hash 关联；旧 payload 继�
 - `speak_update(text, priority, replace)`：异步入队并立即返回；
 - `stop()`：停止当前和等待中的普通播报；
 - `preview(text, voice)`：明确由用户发起的试听。
+
+实现说明：`agentrelay.py mcp-server` 提供无第三方依赖的 stdio JSON-RPC MCP
+server，并注册到 Codex 的 `mcp_servers.agentrelay`。三个工具通过 daemon socket
+调用共享运行时；`speak_update` 进入现有 `enqueue_update` 策略，`stop` 复用播放
+中断，`preview` 使用临时 voice 覆盖但不修改配置。MCP server 不承担 final notify。
 
 原则：
 

@@ -727,6 +727,18 @@ def _handle_daemon_request(payload: dict[str, Any], activity: dict[str, float]) 
                     config[key] = request_data[key]
             if isinstance(request_data.get("speed"), (int, float)) and not isinstance(request_data["speed"], bool):
                 config["speed"] = max(0.25, min(4.0, float(request_data["speed"])))
+            if request_data.get("source") == "mcp":
+                result = enqueue_update(
+                    request_data["text"],
+                    config,
+                    priority=str(request_data.get("priority", "normal")),
+                    replace=bool(request_data.get("interrupt", True)),
+                    turn_id=str(request_data.get("turn_id", "")),
+                )
+                if result.get("status") != "accepted":
+                    return result
+                threading.Thread(target=_daemon_process_queue, args=(activity,), daemon=True).start()
+                return result
             accepted = enqueue(
                 request_data["text"],
                 config,
@@ -735,9 +747,31 @@ def _handle_daemon_request(payload: dict[str, Any], activity: dict[str, float]) 
                 replace=bool(request_data.get("interrupt", True)),
                 turn_id=str(request_data.get("turn_id", "")),
                 item_id=str(request_data.get("id", "")),
+                priority=str(request_data.get("priority", "normal")),
             )
             if not accepted:
                 return {"status": "skipped", "reason": "not_enqueued"}
+        threading.Thread(target=_daemon_process_queue, args=(activity,), daemon=True).start()
+        return {"status": "accepted"}
+    if operation == "preview":
+        request_data = payload.get("request")
+        if not isinstance(request_data, dict) or not isinstance(request_data.get("text"), str):
+            return {"status": "error", "reason": "invalid_request"}
+        config = load_config()
+        if request_data.get("voice"):
+            config["voice"] = str(request_data["voice"])
+        accepted = enqueue(
+            request_data["text"],
+            config,
+            event=str(request_data.get("id", "preview")),
+            source="preview",
+            replace=True,
+            max_chars=int(config.get("spoken_max_chars", 200)),
+            item_id=str(request_data.get("id", "preview")),
+            priority="important",
+        )
+        if not accepted:
+            return {"status": "skipped", "reason": "not_enqueued"}
         threading.Thread(target=_daemon_process_queue, args=(activity,), daemon=True).start()
         return {"status": "accepted"}
     if operation == "stop":
@@ -802,6 +836,123 @@ def daemon() -> int:
         fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
         lock_stream.close()
         _log_event("daemon", "stop", "idle_exit", pid=os.getpid())
+
+
+MCP_TOOLS = {
+    "speak_update": {
+        "description": "Asynchronously speak a concise user-relevant progress update.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Short plain-text update."},
+                "priority": {"type": "string", "enum": ["normal", "important"]},
+                "replace": {"type": "boolean", "default": True},
+                "turn_id": {"type": "string"},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    "stop": {
+        "description": "Stop current playback and clear pending speech.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    "preview": {
+        "description": "Play a user-requested voice preview without changing configuration.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "voice": {"type": "string"},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _mcp_result(payload: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+        "isError": is_error,
+    }
+
+
+def _mcp_call_tool(name: str, arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return _mcp_result({"status": "error", "reason": "arguments_must_be_object"}, True)
+    if name == "speak_update":
+        text = arguments.get("text")
+        priority = arguments.get("priority", "normal")
+        if not isinstance(text, str) or priority not in ("normal", "important"):
+            return _mcp_result({"status": "error", "reason": "invalid_arguments"}, True)
+        if not _daemon_alive():
+            spawn_daemon()
+        response = _socket_request(
+            {
+                "operation": "speak",
+                "request": {
+                    "id": content_id(text),
+                    "text": text,
+                    "source": "mcp",
+                    "priority": priority,
+                    "interrupt": bool(arguments.get("replace", True)),
+                    "turn_id": str(arguments.get("turn_id", "")),
+                },
+            }
+        )
+        return _mcp_result(response or {"status": "error", "reason": "daemon_unavailable"}, response is None)
+    if name == "stop":
+        if not _daemon_alive():
+            return _mcp_result({"status": "stopped", "playback_was_active": _stop_runtime()})
+        response = _socket_request({"operation": "stop", "clear_queue": True})
+        return _mcp_result(response or {"status": "error", "reason": "daemon_unavailable"}, response is None)
+    if name == "preview":
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return _mcp_result({"status": "error", "reason": "invalid_arguments"}, True)
+        if not _daemon_alive():
+            spawn_daemon()
+        response = _socket_request(
+            {
+                "operation": "preview",
+                "request": {"id": str(uuid.uuid4()), "text": text, "voice": arguments.get("voice", "")},
+            }
+        )
+        return _mcp_result(response or {"status": "error", "reason": "daemon_unavailable"}, response is None)
+    return _mcp_result({"status": "error", "reason": "unknown_tool"}, True)
+
+
+def mcp_server() -> int:
+    """Serve the minimal MCP stdio JSON-RPC surface without third-party dependencies."""
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            method = request.get("method")
+            request_id = request.get("id")
+            if method == "notifications/initialized" or request_id is None:
+                continue
+            if method == "initialize":
+                result = {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "agentrelay", "version": "1.0"},
+                }
+            elif method == "tools/list":
+                result = {"tools": [{"name": name, **tool} for name, tool in MCP_TOOLS.items()]}
+            elif method == "tools/call":
+                params = request.get("params", {})
+                result = _mcp_call_tool(params.get("name", ""), params.get("arguments", {}))
+            else:
+                response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}
+                print(json.dumps(response, ensure_ascii=False), flush=True)
+                continue
+            response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+    return 0
 
 
 def system_say(text: str, config: dict[str, Any], item_id: str = "") -> bool:
@@ -1131,6 +1282,15 @@ def _replace_notify(source: str, notify_line: str) -> str:
     return "".join(lines[:start]) + notify_line + "\n" + "".join(lines[end + 1 :])
 
 
+def _mcp_config_block(executable: str) -> str:
+    return (
+        "[mcp_servers.agentrelay]\n"
+        f"command = {_toml_string(executable)}\n"
+        'args = ["mcp-server"]\n'
+        "startup_timeout_sec = 10\n"
+    )
+
+
 def install() -> int:
     if tomllib is None:
         print("agentrelay: install requires Python 3.11 or newer", file=sys.stderr)
@@ -1145,7 +1305,8 @@ def install() -> int:
     executable = str(Path(__file__).resolve())
     target = [executable, "codex-notify"]
     existing = parsed.get("notify")
-    if existing == target:
+    mcp_servers = parsed.get("mcp_servers", {})
+    if existing == target and isinstance(mcp_servers, dict) and "agentrelay" in mcp_servers:
         print("AgentRelay is already installed.")
         return 0
     if existing is not None and not isinstance(existing, list):
@@ -1162,6 +1323,8 @@ def install() -> int:
 
     notify_line = "notify = [" + ", ".join(_toml_string(part) for part in target) + "]"
     updated = _replace_notify(source, notify_line)
+    if not isinstance(mcp_servers, dict) or "agentrelay" not in mcp_servers:
+        updated = updated.rstrip() + "\n\n" + _mcp_config_block(executable)
     CODEX_CONFIG_PATH.write_text(updated, encoding="utf-8")
     Path(executable).chmod(Path(executable).stat().st_mode | 0o111)
     print(f"Installed AgentRelay in {CODEX_CONFIG_PATH}")
@@ -1195,6 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("stop")
     sub.add_parser("daemon")
+    sub.add_parser("mcp-server")
     sub.add_parser("install")
     sub.add_parser("uninstall")
     provider = sub.add_parser("provider", help="select the speech provider")
@@ -1242,6 +1406,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "daemon":
         return daemon()
+    if args.command == "mcp-server":
+        return mcp_server()
     if args.command == "install":
         return install()
     if args.command == "uninstall":

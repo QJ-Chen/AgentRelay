@@ -13,6 +13,8 @@ AgentRelay 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 
 - **播报范围**：当前回合结束通知 + Codex 主动调用的中间进展命令；还不是 token 级响应流。
 - **本地服务**：按需启动 Unix socket daemon，空闲后退出；启动失败时回退到一次性
   `system_say` worker。
+- **MCP 控制面**：提供 `speak_update`、`stop` 和 `preview` 三个 stdio 工具，共用
+  同一队列、冷却、去重和播放策略。
 
 ## 快速开始
 
@@ -174,8 +176,27 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AgentRelay 配置�
 CLI 默认按需启动 `~/.config/agentrelay/agentrelay.sock`，socket 权限为 `0600`。协议为
 每行一个 JSON 请求，支持 `health`、`speak` 和 `stop`。`speak` 可以消费现有持久
 队列，也可携带 provider-neutral request：`id`、`text`、`language`、`voice`、
-`speed`、`interrupt`、`source` 和 `turn_id`。直接运行 `_worker` 的兼容路径仍然
-保留。云调用计数、字符数、失败数和累计延迟写入 `metrics.json`，不记录正文。
+`speed`、`interrupt`、`source` 和 `turn_id`。云调用计数、字符数、失败数和累计
+延迟写入 `metrics.json`，不记录正文。
+
+## MCP 控制面
+
+安装命令会在 `~/.codex/config.toml` 注册 `agentrelay` MCP server。也可以直接
+运行以下命令供支持 stdio MCP 的客户端启动：
+
+```sh
+python3 agentrelay.py mcp-server
+```
+
+工具行为：
+
+- `speak_update(text, priority, replace, turn_id)`：异步提交模型选择的简短进展，
+  复用长度、隐私、冷却、去重和重要级别策略；
+- `stop()`：停止当前播放并清空待播队列；
+- `preview(text, voice)`：明确由用户发起的试听，不修改持久化声音配置。
+
+工具失败只返回 MCP 工具错误，不阻塞 Codex；`notify` 仍保留为可靠的 final
+fallback。
 
 ## 故障排查
 

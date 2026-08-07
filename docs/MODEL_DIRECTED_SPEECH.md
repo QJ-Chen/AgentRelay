@@ -2,12 +2,12 @@
 
 ## Status
 
-The local `speak-update` command is the shipped MVP. The MCP tool described
-below is the next integration option, not a prerequisite for using AgentRelay.
+The local `speak-update` command remains supported. The MCP tools described
+below are now available through the local stdio server.
 
 ## Decision
 
-Add an asynchronous MCP tool for model-selected speech updates. Keep Codex
+Add asynchronous MCP tools for model-selected speech updates. Keep Codex
 `notify` only as a configurable final-turn fallback, not as the primary source
 of spoken content.
 
@@ -58,8 +58,8 @@ Fields:
 The call must enqueue and return immediately. Synthesis and playback must never
 block Codex's next action.
 
-Later controls such as `stop`, `replay`, and voice preview can be separate MCP
-tools. They are not needed for the first increment.
+`stop` and `preview` are available as separate MCP tools. Replay remains
+deferred until speech history has a stable user-facing contract.
 
 ## Speech Policy
 
@@ -175,7 +175,7 @@ enforce cost, length, safety, and queue behavior if the model over-calls.
 
 1. Refactor the current queue into a reusable `SpeakRequest` path shared by
    notify, CLI, and MCP.
-2. Add a local MCP stdio server with `speak_update` and register it in Codex
+2. Add a local MCP stdio server with `speak_update`, `stop`, and `preview`, and register it in Codex
    config without changing the existing notify relay.
 3. Add `source`, `priority`, `replace`, timestamp, and optional turn ID to queue
    records.
