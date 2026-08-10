@@ -45,6 +45,10 @@ WORKER_LOCK = APP_DIR / "worker.lock"
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
 EVENT_LOG = APP_DIR / "events.jsonl"
+VOICE_SOURCE_PATH = PROJECT_DIR / "agentrelay_voice.swift"
+VOICE_INFO_PLIST_PATH = PROJECT_DIR / "agentrelay_voice_info.plist"
+VOICE_HELPER_PATH = APP_DIR / "bin" / "agentrelay-voice"
+VOICE_BUNDLE_ID = "local.agentrelay.voice"
 PROVIDER_LOG = EVENT_LOG  # Backward-compatible public name.
 # The existing notify command is captured during `install`; never bake a
 # machine-specific integration path into the repository defaults.
@@ -500,7 +504,10 @@ def should_speak_final(config: dict[str, Any], turn_id: str = "", content_hash: 
         return False
     if content_hash and any(entry.get("content_hash") == content_hash for entry in recent):
         return False
-    if turn_id or content_hash:
+    # A real turn ID can distinguish this final response from updates associated
+    # with other turns. Content hashes cannot: progress and final text normally
+    # differ, so an unmatched hash must still use the legacy time window.
+    if turn_id and any(entry.get("turn_id") for entry in recent):
         return True
     suppress = max(0, int(config.get("final_notify_suppress_seconds", 120)))
     return time.time() - float(state.get("last_update_at", 0)) > suppress
@@ -1137,6 +1144,14 @@ def doctor() -> int:
     print(f"runtime directory: {APP_DIR} ({'writable' if _directory_writable(APP_DIR) else 'not writable'})")
     print(f"speech: {'available' if Path('/usr/bin/say').exists() else 'missing /usr/bin/say'}")
     print(f"player: {'available' if Path('/usr/bin/afplay').exists() else 'missing /usr/bin/afplay'}")
+    voice_source_available = VOICE_SOURCE_PATH.exists() and VOICE_INFO_PLIST_PATH.exists()
+    voice_toolchain_available = shutil.which("swiftc") is not None
+    print(
+        "voice input: "
+        + ("ready" if VOICE_HELPER_PATH.exists() else "build on first use")
+        + f" (source={'available' if voice_source_available else 'missing'}, toolchain={'available' if voice_toolchain_available else 'missing'})"
+    )
+    print("voice permissions: microphone + Speech Recognition; Accessibility only for --paste")
     print(f"language: {config.get('language', 'zh-CN')}")
     print(f"voice: {config.get('voice', 'Tingting')}")
     print(f"provider: {config.get('provider', 'system_say')}")
@@ -1161,6 +1176,10 @@ def doctor() -> int:
         errors.append("runtime directory is not writable")
     if not Path("/usr/bin/say").exists():
         errors.append("/usr/bin/say is missing")
+    if not voice_source_available:
+        errors.append("voice input helper source or permission metadata is missing")
+    if not voice_toolchain_available and not VOICE_HELPER_PATH.exists():
+        errors.append("push-to-talk requires swiftc for the first build")
     if config.get("provider") == "volcengine":
         if not volcengine_api_key():
             errors.append("Volcengine provider requires VOLCENGINE_TTS_API_KEY")
@@ -1254,6 +1273,185 @@ def status() -> int:
         print("last result: none")
     print(f"event log: {EVENT_LOG}")
     print(f"metrics: {METRICS_PATH}")
+    return 0
+
+
+def _voice_helper_needs_build() -> bool:
+    if not VOICE_HELPER_PATH.exists():
+        return True
+    try:
+        helper_mtime = VOICE_HELPER_PATH.stat().st_mtime
+        return any(path.stat().st_mtime > helper_mtime for path in (VOICE_SOURCE_PATH, VOICE_INFO_PLIST_PATH))
+    except OSError:
+        return True
+
+
+def build_voice_helper() -> bool:
+    """Compile the native macOS recorder into the runtime directory on demand."""
+    if not _voice_helper_needs_build():
+        return True
+    swiftc = shutil.which("swiftc")
+    if not swiftc or not VOICE_SOURCE_PATH.exists() or not VOICE_INFO_PLIST_PATH.exists():
+        return False
+    VOICE_HELPER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = VOICE_HELPER_PATH.with_name(f"{VOICE_HELPER_PATH.name}.{os.getpid()}.tmp")
+    command = [
+        swiftc,
+        str(VOICE_SOURCE_PATH),
+        "-o",
+        str(temporary),
+        "-framework",
+        "AVFoundation",
+        "-framework",
+        "Speech",
+        "-Xlinker",
+        "-sectcreate",
+        "-Xlinker",
+        "__TEXT",
+        "-Xlinker",
+        "__info_plist",
+        "-Xlinker",
+        str(VOICE_INFO_PLIST_PATH),
+    ]
+    try:
+        completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if completed.returncode != 0:
+            _log_event("voice_input", "build", "failed", returncode=completed.returncode)
+            temporary.unlink(missing_ok=True)
+            return False
+        codesign = shutil.which("codesign")
+        if codesign:
+            signed = subprocess.run(
+                [codesign, "--force", "--sign", "-", "--identifier", VOICE_BUNDLE_ID, str(temporary)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if signed.returncode != 0:
+                _log_event("voice_input", "sign", "failed", returncode=signed.returncode)
+                temporary.unlink(missing_ok=True)
+                return False
+        temporary.chmod(0o700)
+        temporary.replace(VOICE_HELPER_PATH)
+        _log_event("voice_input", "build", "succeeded")
+        return True
+    except OSError as exc:
+        _log_event("voice_input", "build", "failed", error=type(exc).__name__)
+        temporary.unlink(missing_ok=True)
+        return False
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/pbcopy"], input=text, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return completed.returncode == 0
+    except OSError:
+        return False
+
+
+def _paste_clipboard() -> bool:
+    script = 'tell application "System Events" to keystroke "v" using command down'
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return completed.returncode == 0
+    except OSError:
+        return False
+
+
+def push_to_talk(locale: str, maximum_seconds: float, *, allow_cloud: bool = False, paste: bool = False) -> int:
+    if not build_voice_helper():
+        print("agentrelay: unable to build the macOS voice helper; install Xcode command-line tools", file=sys.stderr)
+        return 1
+    command = [str(VOICE_HELPER_PATH), "--locale", locale, "--max-seconds", str(maximum_seconds)]
+    if allow_cloud:
+        command.append("--allow-cloud")
+    try:
+        print("Recording. Press Enter to stop.", file=sys.stderr)
+        completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = json.loads(completed.stdout) if completed.stdout else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        _log_event("voice_input", "transcribe", "failed", error=type(exc).__name__)
+        print(json.dumps({"status": "error", "reason": "voice_helper_failed"}), file=sys.stderr)
+        return 1
+    if not result:
+        native_reason = "native_process_signaled" if completed.returncode < 0 else "voice_helper_no_result"
+        diagnostic = {"native_exit": completed.returncode}
+        _log_event("voice_input", "transcribe", "failed", reason=native_reason, **diagnostic)
+        print(json.dumps({"status": "error", "reason": native_reason, **diagnostic}), file=sys.stderr)
+        if completed.stderr.strip():
+            print(completed.stderr.strip(), file=sys.stderr)
+        return completed.returncode if completed.returncode > 0 else 1
+    if completed.returncode != 0 or result.get("status") != "transcribed":
+        reason = str(result.get("reason", "transcription_failed"))
+        diagnostic = {
+            key: result[key]
+            for key in ("error_domain", "error_code", "audio_buffers", "audio_peak")
+            if key in result
+        }
+        _log_event("voice_input", "transcribe", "failed", reason=reason, **diagnostic)
+        print(json.dumps({"status": "error", "reason": reason, **diagnostic}), file=sys.stderr)
+        return completed.returncode or 1
+    text = str(result.get("text", "")).strip()
+    if not text:
+        print(json.dumps({"status": "error", "reason": "empty_transcript"}), file=sys.stderr)
+        return 1
+    copied = _copy_to_clipboard(text)
+    pasted = paste and copied and _paste_clipboard()
+    _log_event(
+        "voice_input",
+        "transcribe",
+        "succeeded",
+        characters=len(text),
+        locale=locale,
+        on_device=not allow_cloud,
+        copied=copied,
+        pasted=pasted,
+    )
+    print(text)
+    if not copied:
+        print("agentrelay: transcript could not be copied to the clipboard", file=sys.stderr)
+        return 1
+    if paste and not pasted:
+        print(
+            "agentrelay: transcript was copied but paste failed; focus Codex and grant Accessibility permission",
+            file=sys.stderr,
+        )
+        return 1
+    print("agentrelay: transcript pasted for review; submit it manually" if pasted else "agentrelay: transcript copied to clipboard", file=sys.stderr)
+    return 0
+
+
+def reset_voice_permissions(reset_all: bool = False) -> int:
+    """Explain or explicitly perform the macOS TCC reset for voice input."""
+    tccutil = Path("/usr/bin/tccutil")
+    if not tccutil.exists():
+        print("agentrelay: tccutil is unavailable", file=sys.stderr)
+        return 1
+    if not reset_all:
+        print("AgentRelay cannot reset permissions for its ad-hoc command-line helper directly.", file=sys.stderr)
+        print("Open System Settings > Privacy & Security > Microphone and Speech Recognition.", file=sys.stderr)
+        print("Enable your terminal, then run push-to-talk again. Use --all only to reset every app.", file=sys.stderr)
+        return 2
+    failures = []
+    for service in ("Microphone", "SpeechRecognition"):
+        completed = subprocess.run(
+            [str(tccutil), "reset", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.returncode != 0:
+            failures.append(service)
+    if failures:
+        print(f"agentrelay: unable to reset permissions: {', '.join(failures)}", file=sys.stderr)
+        return 1
+    print("AgentRelay voice permissions reset; the next push-to-talk run will ask again.")
     return 0
 
 
@@ -1365,6 +1563,17 @@ def main(argv: list[str] | None = None) -> int:
     provider.add_argument("name", choices=("system_say", "volcengine"))
     language = sub.add_parser("language", help="select the speech language")
     language.add_argument("name", choices=tuple(SUPPORTED_LANGUAGES))
+    push_to_talk_parser = sub.add_parser("push-to-talk", help="record and transcribe an editable Codex prompt")
+    push_to_talk_parser.add_argument("--locale", choices=tuple(SUPPORTED_LANGUAGES))
+    push_to_talk_parser.add_argument("--max-seconds", type=float, default=60.0)
+    push_to_talk_parser.add_argument("--allow-cloud", action="store_true")
+    push_to_talk_parser.add_argument("--paste", action="store_true")
+    reset_voice_parser = sub.add_parser("voice-reset-permissions", help="show or reset push-to-talk privacy permissions")
+    reset_voice_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="reset this privacy category for every application",
+    )
     test_volcengine = sub.add_parser("volcengine-test")
     test_volcengine.add_argument("text", nargs="*", default=["你好，豆包语音合成模型二点零已经接入 AgentRelay。"])
     sub.add_parser("volcengine-enable")
@@ -1416,6 +1625,16 @@ def main(argv: list[str] | None = None) -> int:
         return set_provider(args.name)
     if args.command == "language":
         return set_language(args.name)
+    if args.command == "push-to-talk":
+        config = load_config()
+        return push_to_talk(
+            args.locale or str(config.get("language", "zh-CN")),
+            args.max_seconds,
+            allow_cloud=args.allow_cloud,
+            paste=args.paste,
+        )
+    if args.command == "voice-reset-permissions":
+        return reset_voice_permissions(args.all)
     if args.command == "volcengine-test":
         return 0 if volcengine_speak(" ".join(args.text), load_config()) else 1
     if args.command == "volcengine-enable":
@@ -1424,7 +1643,7 @@ def main(argv: list[str] | None = None) -> int:
     turn_id = notify_turn_id(args.event_and_payload)
     config = load_config()
     final_content_hash = content_id(clean_text(text, int(config.get("final_spoken_max_chars", 200))))
-    _log_event("notify", "received", "accepted", event=event or "unknown", has_text=bool(text))
+    _log_event("notify", "received", "accepted", notify_event=event or "unknown", has_text=bool(text))
     # Forward first so an audio failure cannot affect the existing integration.
     forward_notify(config, args.event_and_payload)
     try:

@@ -15,6 +15,8 @@ AgentRelay 是一个 macOS 优先的 Codex 语音通知适配器。它把 Codex 
   `system_say` worker。
 - **MCP 控制面**：提供 `speak_update`、`stop` 和 `preview` 三个 stdio 工具，共用
   同一队列、冷却、去重和播放策略。
+- **Push-to-talk 输入**：使用 macOS 原生 Speech framework 录音转写，默认复制到剪贴板，
+  可选粘贴到当前 Codex 输入框；不会自动提交。
 
 ## 快速开始
 
@@ -74,6 +76,55 @@ python3 agentrelay.py speak-update --turn-id TURN_ID "阶段结果已完成。"
 命令会立即返回 JSON，合成和播放在后台执行。运行时会拒绝空文本、过长文本、
 重复内容和过于频繁的普通更新，并清理 Markdown、代码、URL、路径和疑似凭据。
 返回 `skipped` 时不要立即重复发送同一条消息。
+
+## Push-to-talk 输入
+
+录音转写一个可编辑的 Codex 提示词：
+
+```sh
+python3 agentrelay.py push-to-talk
+```
+
+默认使用当前语言配置（中文为 `zh-CN`），并要求 macOS Speech framework 支持设备端
+识别。开始录音后按 Enter 停止，转写结果会打印并复制到剪贴板；将结果粘贴到 Codex
+后请手动检查和提交。
+
+直接粘贴到当前获得焦点的 Codex 输入框：
+
+```sh
+python3 agentrelay.py push-to-talk --paste
+```
+
+`--paste` 只发送 Command-V，不会按 Enter，也不会自动执行 Codex 命令。首次使用时
+macOS 会请求麦克风和 Speech Recognition 权限；`--paste` 还需要在系统设置中允许
+终端控制键盘（Accessibility）。
+
+可用参数：
+
+- `--locale zh-CN` 或 `--locale en-US`：临时覆盖语言；
+- `--max-seconds 60`：录音最长时长，按 Enter 可提前结束；
+- `--allow-cloud`：设备端识别不可用时，明确允许 Apple Speech 使用云识别。
+
+首次运行会把 Swift helper 编译到 `~/.config/agentrelay/bin/`。录音只在命令运行期间
+进行，不保存音频；转写正文不会写入 AgentRelay 日志、指标或队列。
+
+如果 macOS 拒绝权限或 helper 更新后不再弹出授权窗口，先运行诊断提示：
+
+```sh
+python3 agentrelay.py voice-reset-permissions
+```
+
+然后在 `System Settings > Privacy & Security > Microphone` 和 `Speech Recognition`
+中启用你运行命令的终端应用，再运行 `push-to-talk`。由于 helper 是命令行程序，
+macOS 通常把权限归属于启动它的终端，而不是 AgentRelay helper 本身。
+
+如确实需要让 macOS 清空这两个类别的全部应用授权，可显式执行：
+
+```sh
+python3 agentrelay.py voice-reset-permissions --all
+```
+
+`--all` 会影响所有应用，之后 macOS 会重新询问相关权限。
 
 要让 Codex 知道何时值得播报，可将
 [Codex Speech Guidance](docs/CODEX_SPEECH_GUIDANCE.md) 合并到相应的
@@ -151,6 +202,7 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AgentRelay 配置�
 | `python3 agentrelay.py stop` | 停止当前播放并清空等待队列 |
 | `python3 agentrelay.py speak TEXT` | 手动测试一次语音 |
 | `python3 agentrelay.py speak-update TEXT` | 排队一条模型选择的简短进展 |
+| `python3 agentrelay.py push-to-talk` | 录音并将转写复制到剪贴板 |
 | `python3 agentrelay.py provider NAME` | 在 `system_say` 和 `volcengine` 间切换 |
 | `python3 agentrelay.py language NAME` | 在 `zh-CN` 和 `en-US` 间切换语言 |
 | `python3 agentrelay.py volcengine-test TEXT` | 不改变 provider，测试火山引擎请求 |
@@ -167,6 +219,7 @@ API key 只从环境变量或项目 `.env` 读取，不写入 AgentRelay 配置�
 - `spoken_max_chars`、`normal_cooldown_seconds`：中间播报的长度和频率；
 - `final_notify_mode`：`off`、`if_not_spoken` 或 `always`；
 - `forward_notify`：已有通知命令，安装时自动保存。
+- push-to-talk：默认设备端识别；`--allow-cloud` 才允许云识别；`--paste` 需要辅助功能权限。
 
 完整示例见 [examples/config.example.json](examples/config.example.json)。
 运行数据默认写入 `~/.config/agentrelay/`；测试时可设置 `AGENTRELAY_HOME` 使用隔离目录。
@@ -224,6 +277,7 @@ python3 -m py_compile agentrelay.py volcengine_protocol.py volcengine_tts.py
 - [产品需求](docs/PRD.md)
 - [架构分析](docs/ARCHITECTURE.md)
 - [模型主动播报设计](docs/MODEL_DIRECTED_SPEECH.md)
+- [Push-to-talk 设计](docs/PUSH_TO_TALK.md)
 - [本地 TTS 模型计划](docs/LOCAL_TTS_MODEL.md)
 - [Codex 播报指导](docs/CODEX_SPEECH_GUIDANCE.md)
 - [Roadmap 与头脑风暴](docs/ROADMAP.md)

@@ -29,7 +29,7 @@
 - 播放过程中强制中断已经运行的 `say` 或 `afplay`；
 - MCP 工具集成；
 - 神经 TTS 模型的默认安装；
-- ASR、VAD、语音对话或跨设备播放。
+- 常驻监听、VAD、语音对话或跨设备播放；当前仅提供显式 push-to-talk 转写。
 
 ## 优先级总览
 
@@ -42,6 +42,7 @@
 | P1 | 精确 turn 关联 | 正确抑制同一回合的 final fallback | Phase 2 |
 | P2 | MCP 控制面 | 提供显式播报、停止、试听等工具 | Phase 4 |
 | P2 | 响应流接入 | 在 Codex 生成过程中按句合成 | Phase 5 |
+| P2 | Push-to-talk 输入 | 以可编辑、非自动提交的转写进入 Codex | Phase 4 |
 | P3 | ASR/VAD/语音交互 | 从单向提醒扩展到免手操作 | Explore |
 | P3 | 插件和跨平台 | 降低安装成本，支持 Linux/Windows | Explore |
 

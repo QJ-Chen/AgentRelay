@@ -24,6 +24,48 @@ class AgentRelayTest(unittest.TestCase):
     def test_defaults_use_chinese_language(self):
         self.assertEqual(agentrelay.defaults()["language"], "zh-CN")
 
+    def test_push_to_talk_copies_transcript_without_submitting(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": '{"status":"transcribed","text":"请检查测试结果"}\n'})()
+        with patch.object(agentrelay, "build_voice_helper", return_value=True), patch.object(
+            agentrelay.subprocess, "run", return_value=completed
+        ) as run, patch.object(agentrelay, "_copy_to_clipboard", return_value=True) as copy, patch.object(
+            agentrelay, "_log_event"
+        ):
+            self.assertEqual(agentrelay.push_to_talk("zh-CN", 30), 0)
+        copy.assert_called_once_with("请检查测试结果")
+        self.assertEqual(run.call_args.args[0][1:3], ["--locale", "zh-CN"])
+
+    def test_push_to_talk_paste_is_explicit(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": '{"status":"transcribed","text":"运行测试"}\n'})()
+        with patch.object(agentrelay, "build_voice_helper", return_value=True), patch.object(
+            agentrelay.subprocess, "run", return_value=completed
+        ), patch.object(agentrelay, "_copy_to_clipboard", return_value=True), patch.object(
+            agentrelay, "_paste_clipboard", return_value=True
+        ) as paste, patch.object(agentrelay, "_log_event"):
+            self.assertEqual(agentrelay.push_to_talk("zh-CN", 30, paste=True), 0)
+        paste.assert_called_once_with()
+
+    def test_push_to_talk_reports_native_process_without_json(self):
+        completed = type("Completed", (), {"returncode": -6, "stdout": "", "stderr": "native crash"})()
+        with patch.object(agentrelay, "build_voice_helper", return_value=True), patch.object(
+            agentrelay.subprocess, "run", return_value=completed
+        ), patch.object(agentrelay, "_log_event"):
+            self.assertEqual(agentrelay.push_to_talk("zh-CN", 30), 1)
+
+    def test_reset_voice_permissions_resets_both_services(self):
+        completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+        with patch.object(agentrelay.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(agentrelay.reset_voice_permissions(reset_all=True), 0)
+        self.assertEqual(
+            [call.args[0][2] for call in run.call_args_list],
+            ["Microphone", "SpeechRecognition"],
+        )
+
+    def test_reset_voice_permissions_does_not_reset_by_default(self):
+        with patch.object(agentrelay.subprocess, "run") as run:
+            self.assertEqual(agentrelay.reset_voice_permissions(), 2)
+        run.assert_not_called()
+
     def test_speak_request_builds_provider_neutral_request(self):
         config = agentrelay.defaults()
         request = agentrelay.SpeakRequest.from_item(
@@ -101,6 +143,23 @@ class AgentRelayTest(unittest.TestCase):
     def test_parse_nested_last_message(self):
         event, text = agentrelay.parse_notify(["turn-ended", json.dumps({"items": [{"text": "old"}, {"message": "new"}]})])
         self.assertEqual((event, text), ("turn-ended", "new"))
+
+    def test_codex_notify_enqueues_final_response(self):
+        config = agentrelay.defaults()
+        with patch.object(agentrelay, "load_config", return_value=config), patch.object(
+            agentrelay, "forward_notify"
+        ), patch.object(agentrelay, "enqueue", return_value=True) as enqueue, patch.object(
+            agentrelay, "start_runtime", return_value=True
+        ), patch.object(agentrelay, "_log_event") as log_event:
+            payload = json.dumps(
+                {"type": "agent-turn-complete", "last-assistant-message": "这是最终回答测试"}
+            )
+            self.assertEqual(agentrelay.main(["codex-notify", payload]), 0)
+
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.args[0], "这是最终回答测试")
+        received = next(call for call in log_event.call_args_list if call.args[:3] == ("notify", "received", "accepted"))
+        self.assertEqual(received.kwargs["notify_event"], "agent-turn-complete")
 
     def test_enqueue_deduplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -243,6 +302,34 @@ class AgentRelayTest(unittest.TestCase):
             state.write_text(json.dumps({"last_update_at": 100.0}))
             with patch.object(agentrelay, "SPEECH_STATE_PATH", state), patch.object(agentrelay.time, "time", return_value=110.0):
                 self.assertFalse(agentrelay.should_speak_final(agentrelay.defaults()))
+
+    def test_recent_update_without_turn_id_suppresses_different_final_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "speech-state.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "last_update_at": 100.0,
+                        "recent": [
+                            {
+                                "created": 100.0,
+                                "turn_id": "",
+                                "content_hash": "progress-hash",
+                            }
+                        ],
+                    }
+                )
+            )
+            with patch.object(agentrelay, "SPEECH_STATE_PATH", state), patch.object(
+                agentrelay.time, "time", return_value=110.0
+            ):
+                self.assertFalse(
+                    agentrelay.should_speak_final(
+                        agentrelay.defaults(),
+                        turn_id="notify-turn-id",
+                        content_hash="different-final-hash",
+                    )
+                )
 
     def test_turn_id_suppresses_only_matching_final_notify(self):
         with tempfile.TemporaryDirectory() as directory:
